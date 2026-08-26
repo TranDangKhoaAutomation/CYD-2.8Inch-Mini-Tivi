@@ -7,16 +7,16 @@
 #include <WiFiManager.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
-#include <TFT_eSPI.h>
 #include <JPEGDEC.h>
+#include "display/display.h"
 #include "color_test_jpeg.h"
 #include "config.h"
 
 #include <vector>
 #include <functional>
 
-TFT_eSPI tft;
 JPEGDEC jpeg;
+#define tft (*display())
 SPIClass sdSPI(VSPI);
 
 static constexpr uint16_t DISCOVERY_SERVER_PORT = 4210;
@@ -137,40 +137,24 @@ static String shorten(const String &s, size_t n) {
   return s.substring(0, n > 3 ? n - 3 : n) + "...";
 }
 
-static inline uint16_t swapRB565(uint16_t c) {
-  return (uint16_t)(((c & 0x001Fu) << 11) | (c & 0x07E0u) | ((c & 0xF800u) >> 11));
-}
-
 static int jpegDraw(JPEGDRAW *p) {
   uint32_t t0 = ytDecodeInProgress ? micros() : 0;
-  uint16_t *pixels = (uint16_t *)p->pPixels;
-  if (jpegSwapRB) {
-    const int count = p->iWidth * p->iHeight;
-    for (int i = 0; i < count; ++i) pixels[i] = swapRB565(pixels[i]);
-  }
-  tft.pushImage(p->x, p->y, p->iWidth, p->iHeight, pixels);
+  int ok = jpegDrawCallback(p);
   if (ytDecodeInProgress) ytRenderUs += (uint32_t)(micros() - t0);
-  return 1;
+  return ok;
 }
 
 static void applyJPEGColorMode(char mode) {
-  mode = (char)toupper((unsigned char)mode);
-  if (mode < 'A' || mode > 'D') mode = 'D';
-  jpegColorMode = mode;
-  switch (mode) {
-    case 'A': jpegPixelType = RGB565_BIG_ENDIAN;    jpegSwapBytes = false; break;
-    case 'B': jpegPixelType = RGB565_BIG_ENDIAN;    jpegSwapBytes = true;  break;
-    case 'C': jpegPixelType = RGB565_LITTLE_ENDIAN; jpegSwapBytes = false; break;
-    default:  jpegPixelType = RGB565_LITTLE_ENDIAN; jpegSwapBytes = true;  break;
-  }
-  tft.setSwapBytes(jpegSwapBytes);
-  Serial.printf("[COLOR] mode=%c jpeg=%s tftSwap=%d\n", jpegColorMode,
-                jpegPixelType == RGB565_BIG_ENDIAN ? "BIG" : "LITTLE", jpegSwapBytes ? 1 : 0);
+  (void)mode;
+  jpegColorMode = 'A';
+  jpegPixelType = RGB565_BIG_ENDIAN;
+  jpegSwapBytes = false;
+  jpegSwapRB = false;
+  Serial.println("[COLOR] verified path: RGB565_BIG_ENDIAN -> Arduino_GFX BE bitmap");
 }
 
 static inline void prepareJPEGDecode() {
-  tft.setSwapBytes(jpegSwapBytes);
-  jpeg.setPixelType(jpegPixelType);
+  jpeg.setPixelType(RGB565_BIG_ENDIAN);
 }
 
 
@@ -1523,14 +1507,13 @@ void setup() {
   ledcAttachPin(BL_PIN, BL_CHANNEL);
   setBrightness(DEFAULT_BRIGHT);
 
-  tft.init();
-  tft.setRotation(1);
+  if (!displayBegin()) {
+    Serial.println("[TFT] Arduino_GFX init failed");
+    while (true) delay(1000);
+  }
   delay(20);
-  // Match the known-good CYD Slideshow JPEG path exactly:
-  // JPEGDEC default RGB565 little-endian + TFT_eSPI byte swap.
-  applyJPEGColorMode('D');
-  tft.fillScreen(TFT_BLACK);
-  logTFTDiagnostics();
+  applyJPEGColorMode('A');
+  Serial.println("[TFT] Arduino_GFX ILI9341 320x240 rotation=1 inversion=ON spi=40MHz");
 
   // XPT2046 touch uses software SPI. The CYD routes TFT, touch and SD to
   // three different pin groups but the classic ESP32 only has two user SPI hosts.
@@ -1543,7 +1526,7 @@ void setup() {
   digitalWrite(TOUCH_CLK, LOW);
 
   // SD owns VSPI exclusively: SCK=18, MISO=19, MOSI=23, CS=5.
-  // TFT_eSPI is compiled with USE_HSPI_PORT=1, so it cannot remap this bus.
+  // TFT uses its dedicated HSPI-style pin set through Arduino_GFX; SD remains on VSPI.
   pinMode(SD_CS, OUTPUT);
   digitalWrite(SD_CS, HIGH);
   sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
