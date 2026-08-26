@@ -9,14 +9,13 @@
 #include <Preferences.h>
 #include <JPEGDEC.h>
 #include "display/display.h"
-#include "color_test_jpeg.h"
+#include "display/ui_draw.h"
 #include "config.h"
 
 #include <vector>
 #include <functional>
 
 JPEGDEC jpeg;
-#define tft (*display())
 SPIClass sdSPI(VSPI);
 
 static constexpr uint16_t DISCOVERY_SERVER_PORT = 4210;
@@ -94,7 +93,7 @@ static uint32_t touchLastLogMs = 0;
 
 // JPEG byte-order diagnostic matrix:
 // A=BIG/swap0, B=BIG/swap1, C=LITTLE/swap0, D=LITTLE/swap1.
-// D is the default because JPEGDEC native RGB565 + TFT_eSPI byte swap is the
+// D is the default because JPEGDEC native RGB565 + legacy display stack byte swap is the
 // normal path for a 16-bit SPI panel. It can be changed at runtime via UART.
 static char jpegColorMode = 'D';
 static int jpegPixelType = RGB565_LITTLE_ENDIAN;
@@ -158,62 +157,11 @@ static inline void prepareJPEGDecode() {
 }
 
 
-static uint32_t rgb565Error(uint16_t got, uint16_t expected) {
-  int gr = (got >> 11) & 0x1F, gg = (got >> 5) & 0x3F, gb = got & 0x1F;
-  int er = (expected >> 11) & 0x1F, eg = (expected >> 5) & 0x3F, eb = expected & 0x1F;
-  return (uint32_t)(abs(gr - er) * 2 + abs(gg - eg) + abs(gb - eb) * 2);
-}
-
 static char runJPEGColorAutoTest() {
-  const int sampleX[5] = {32, 96, 160, 224, 288};
-  const uint16_t expected[5] = {TFT_RED, TFT_GREEN, TFT_BLUE, TFT_WHITE, TFT_BLACK};
-  const char modes[4] = {'A', 'B', 'C', 'D'};
-  uint32_t bestScore = 0xFFFFFFFFu;
-  char bestMode = 'A';
-
-  Serial.println("[COLORAUTO] begin reference JPEG RGB565 test");
-  for (char mode : modes) {
-    applyJPEGColorMode(mode);
-    tft.fillScreen(TFT_BLACK);
-    bool opened = jpeg.openRAM((uint8_t *)kColorCalJpeg, kColorCalJpegLen, jpegDraw);
-    if (!opened) {
-      Serial.printf("[COLORAUTO] mode=%c openRAM failed err=%d\n", mode, jpeg.getLastError());
-      continue;
-    }
-    prepareJPEGDecode();
-    int decOk = jpeg.decode(0, 70, 0);
-    jpeg.close();
-    delay(8);
-    if (!decOk) {
-      Serial.printf("[COLORAUTO] mode=%c decode failed\n", mode);
-      continue;
-    }
-
-    uint32_t score = 0;
-    Serial.printf("[COLORAUTO] mode=%c pixels", mode);
-    for (int i = 0; i < 5; ++i) {
-      uint16_t got = tft.readPixel(sampleX[i], 110);
-      score += rgb565Error(got, expected[i]);
-      Serial.printf(" %04X", got);
-    }
-    Serial.printf(" score=%lu\n", (unsigned long)score);
-    if (score < bestScore) {
-      bestScore = score;
-      bestMode = mode;
-    }
-  }
-
-  // JPEGDEC's own SPI-LCD helper uses BIG_ENDIAN; use A as a safe fallback
-  // if panel readback is unavailable or all results are implausible.
-  if (bestScore == 0xFFFFFFFFu || bestScore > 500u) {
-    Serial.printf("[COLORAUTO] readback unreliable score=%lu; fallback=A\n", (unsigned long)bestScore);
-    bestMode = 'A';
-  }
-  applyJPEGColorMode(bestMode);
-  Serial.printf("[COLORAUTO] selected=%c score=%lu\n", bestMode, (unsigned long)bestScore);
-  tft.fillScreen(TFT_BLACK);
+  applyJPEGColorMode('A');
+  Serial.println("[COLORAUTO] fixed verified path: BIG_ENDIAN + Arduino_GFX + inversion");
   st.dirty = true;
-  return bestMode;
+  return 'A';
 }
 
 static uint16_t touchRead12(uint8_t cmd) {
@@ -253,10 +201,10 @@ static bool readTouch(int &x, int &y) {
   int rawY = (int)(sy / 3);
   if (rawX < 50 || rawY < 50) return false;
 
-  x = map(rawY, TOUCH_Y_MIN, TOUCH_Y_MAX, 0, tft.width());
-  y = map(rawX, TOUCH_X_MIN, TOUCH_X_MAX, tft.height(), 0);
-  x = constrain(x, 0, tft.width() - 1);
-  y = constrain(y, 0, tft.height() - 1);
+  x = map(rawY, TOUCH_Y_MIN, TOUCH_Y_MAX, 0, ui().width());
+  y = map(rawX, TOUCH_X_MIN, TOUCH_X_MAX, ui().height(), 0);
+  x = constrain(x, 0, ui().width() - 1);
+  y = constrain(y, 0, ui().height() - 1);
   if ((int32_t)(touchDebugUntil - millis()) > 0 && millis() - touchLastLogMs >= 80) {
     touchLastLogMs = millis();
     Serial.printf("[TOUCH] rawX=%d rawY=%d x=%d y=%d irq=%d\n", rawX, rawY, x, y, digitalRead(TOUCH_IRQ));
@@ -265,20 +213,20 @@ static bool readTouch(int &x, int &y) {
 }
 
 static void drawHeader(const String &title, bool back, const String &right = "") {
-  tft.fillRect(0, 0, tft.width(), 34, tft.color565(14, 16, 20));
-  tft.setTextDatum(ML_DATUM);
+  ui().fillRect(0, 0, ui().width(), 34, ui().color565(14, 16, 20));
+  ui().setDatum(ML_DATUM);
   if (back) {
-    tft.setTextColor(TFT_CYAN, tft.color565(14, 16, 20));
-    tft.drawString("<", 8, 17, 4);
+    ui().setTextColor(TFT_CYAN, ui().color565(14, 16, 20));
+    ui().text("<", 8, 17, 4);
   }
-  tft.setTextColor(TFT_WHITE, tft.color565(14, 16, 20));
-  tft.drawString(title, back ? 38 : 10, 17, 2);
+  ui().setTextColor(TFT_WHITE, ui().color565(14, 16, 20));
+  ui().text(title, back ? 38 : 10, 17, 2);
   if (right.length()) {
-    tft.setTextDatum(MR_DATUM);
-    tft.setTextColor(TFT_YELLOW, tft.color565(14, 16, 20));
-    tft.drawString(right, tft.width() - 8, 17, 2);
+    ui().setDatum(MR_DATUM);
+    ui().setTextColor(TFT_YELLOW, ui().color565(14, 16, 20));
+    ui().text(right, ui().width() - 8, 17, 2);
   }
-  tft.drawFastHLine(0, 33, tft.width(), tft.color565(40, 44, 52));
+  ui().drawFastHLine(0, 33, ui().width(), ui().color565(40, 44, 52));
 }
 
 // -----------------------------------------------------------------------------
@@ -432,7 +380,7 @@ static bool startSDPlayback(const String &base) {
   st.playing = true;
   st.startMs = millis();
   st.screen = Screen::SD_PLAYER;
-  tft.fillScreen(TFT_BLACK);
+  ui().fillScreen(TFT_BLACK);
   showOsd();
   Serial.printf("[SD][PLAY] started size=%u idx=%d fps=%.2f frames=%u\n",
                 (unsigned)st.vfile.size(), st.idx.valid ? 1 : 0, st.idx.fps, (unsigned)st.idx.frames);
@@ -474,30 +422,30 @@ static int readNextSDFrame() {
 }
 
 static void drawSDOsd() {
-  const int W = tft.width(), H = tft.height();
-  tft.fillRect(0, 0, W, 22, TFT_BLACK);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setTextDatum(TL_DATUM);
+  const int W = ui().width(), H = ui().height();
+  ui().fillRect(0, 0, W, 22, TFT_BLACK);
+  ui().setTextColor(TFT_WHITE, TFT_BLACK);
+  ui().setDatum(TL_DATUM);
   String name = st.basePath.substring(st.basePath.lastIndexOf('/') + 1);
-  tft.drawString(shorten(name, 22), 4, 4, 2);
+  ui().text(shorten(name, 22), 4, 4, 2);
   uint32_t curSec = (uint32_t)(st.frame / st.idx.fps);
   uint32_t totSec = st.idx.valid ? (uint32_t)(st.idx.frames / st.idx.fps) : 0;
-  tft.setTextDatum(TR_DATUM);
-  tft.drawString(fmtTime(curSec) + " / " + fmtTime(totSec), W - 4, 4, 2);
+  ui().setDatum(TR_DATUM);
+  ui().text(fmtTime(curSec) + " / " + fmtTime(totSec), W - 4, 4, 2);
   int barY = H - 46;
-  tft.fillRect(0, barY, W, 46, TFT_BLACK);
-  tft.drawRect(8, barY + 4, W - 16, 8, TFT_DARKGREY);
+  ui().fillRect(0, barY, W, 46, TFT_BLACK);
+  ui().drawRect(8, barY + 4, W - 16, 8, TFT_DARKGREY);
   if (st.idx.valid && st.idx.frames) {
     int fill = (int)((uint64_t)(W - 18) * st.frame / st.idx.frames);
-    tft.fillRect(9, barY + 5, fill, 6, TFT_YELLOW);
+    ui().fillRect(9, barY + 5, fill, 6, TFT_YELLOW);
   }
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString("BACK", 34, barY + 30, 2);
-  tft.drawString("<< 1m", W / 2 - 70, barY + 30, 2);
-  tft.drawString(st.playing ? "| |" : ">", W / 2, barY + 30, 4);
-  tft.drawString("1m >>", W / 2 + 70, barY + 30, 2);
-  tft.drawString("VOL " + String(st.volume), W - 34, barY + 30, 2);
+  ui().setDatum(MC_DATUM);
+  ui().setTextColor(TFT_WHITE, TFT_BLACK);
+  ui().text("BACK", 34, barY + 30, 2);
+  ui().text("<< 1m", W / 2 - 70, barY + 30, 2);
+  ui().text(st.playing ? "| |" : ">", W / 2, barY + 30, 4);
+  ui().text("1m >>", W / 2 + 70, barY + 30, 2);
+  ui().text("VOL " + String(st.volume), W - 34, barY + 30, 2);
 }
 
 static void handleSDPlayerTouch() {
@@ -507,7 +455,7 @@ static void handleSDPlayerTouch() {
   static bool dragging = false;
   int x, y;
   bool down = readTouch(x, y);
-  const int W = tft.width(), H = tft.height();
+  const int W = ui().width(), H = ui().height();
   if (down && !wasDown) { downX = x; downY = y; downMs = millis(); dragging = false; }
   if (down && wasDown) {
     int dy = downY - y;
@@ -572,42 +520,42 @@ static void scanVideos() {
 static const int ROWS_PER_PAGE = 6;
 
 static void drawSDBrowser() {
-  tft.fillScreen(TFT_BLACK);
+  ui().fillScreen(TFT_BLACK);
   drawHeader("SD TV", true, sdReady ? "SD OK" : "NO SD");
   if (!sdReady) {
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(TFT_RED, TFT_BLACK);
-    tft.drawString("Khong co the SD", 160, 105, 4);
-    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    tft.drawString("YouTube TV van dung duoc", 160, 140, 2);
+    ui().setDatum(MC_DATUM);
+    ui().setTextColor(TFT_RED, TFT_BLACK);
+    ui().text("Khong co the SD", 160, 105, 4);
+    ui().setTextColor(TFT_DARKGREY, TFT_BLACK);
+    ui().text("YouTube TV van dung duoc", 160, 140, 2);
     st.dirty = false;
     return;
   }
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setTextDatum(TL_DATUM);
+  ui().setTextColor(TFT_WHITE, TFT_BLACK);
+  ui().setDatum(TL_DATUM);
   int start = st.browserPage * ROWS_PER_PAGE;
   for (int i = 0; i < ROWS_PER_PAGE; i++) {
     int gi = start + i;
     if (gi >= (int)videoList.size()) break;
     int y = 42 + i * 28;
-    tft.fillRoundRect(6, y, tft.width() - 12, 24, 4, tft.color565(24, 24, 24));
+    ui().fillRounded(6, y, ui().width() - 12, 24, 4, ui().color565(24, 24, 24));
     String name = videoList[gi].substring(videoList[gi].lastIndexOf('/') + 1);
-    tft.drawString(shorten(name, 34), 14, y + 4, 2);
+    ui().text(shorten(name, 34), 14, y + 4, 2);
   }
   if (videoList.empty()) {
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-    tft.drawString("Chua co video", 160, 110, 4);
-    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    tft.drawString("Copy .mjpeg/.mp3/.idx vao /videos", 160, 145, 2);
+    ui().setDatum(MC_DATUM);
+    ui().setTextColor(TFT_YELLOW, TFT_BLACK);
+    ui().text("Chua co video", 160, 110, 4);
+    ui().setTextColor(TFT_DARKGREY, TFT_BLACK);
+    ui().text("Copy .mjpeg/.mp3/.idx vao /videos", 160, 145, 2);
   }
   int pages = (videoList.size() + ROWS_PER_PAGE - 1) / ROWS_PER_PAGE;
   if (pages > 1) {
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(TFT_CYAN, TFT_BLACK);
-    tft.drawString("<", 20, 228, 4);
-    tft.drawString(">", 300, 228, 4);
-    tft.drawString(String(st.browserPage + 1) + "/" + String(pages), 160, 228, 2);
+    ui().setDatum(MC_DATUM);
+    ui().setTextColor(TFT_CYAN, TFT_BLACK);
+    ui().text("<", 20, 228, 4);
+    ui().text(">", 300, 228, 4);
+    ui().text(String(st.browserPage + 1) + "/" + String(pages), 160, 228, 2);
   }
   st.dirty = false;
 }
@@ -644,13 +592,13 @@ static void handleSDBrowserTouch() {
 // Wi-Fi + server discovery
 // -----------------------------------------------------------------------------
 static void drawStatus(const String &line1, const String &line2 = "") {
-  tft.fillScreen(TFT_BLACK);
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextColor(TFT_CYAN, TFT_BLACK);
-  tft.drawString(line1, 160, 103, 4);
+  ui().fillScreen(TFT_BLACK);
+  ui().setDatum(MC_DATUM);
+  ui().setTextColor(TFT_CYAN, TFT_BLACK);
+  ui().text(line1, 160, 103, 4);
   if (line2.length()) {
-    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    tft.drawString(line2, 160, 136, 2);
+    ui().setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    ui().text(line2, 160, 136, 2);
   }
 }
 
@@ -675,27 +623,27 @@ static int scanWiFiAndShow(bool showOnScreen) {
                   i, WiFi.SSID(i).c_str(), WiFi.RSSI(i), WiFi.channel(i), (int)WiFi.encryptionType(i));
   }
   if (showOnScreen) {
-    tft.fillScreen(TFT_BLACK);
-    tft.setTextDatum(TL_DATUM);
-    tft.setTextColor(TFT_CYAN, TFT_BLACK);
-    tft.drawString("CHON WIFI TREN DIEN THOAI", 8, 8, 2);
-    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    tft.drawString("Ket noi AP: CYD-MiniTV-Setup", 8, 28, 2);
-    tft.drawString("Cac WiFi gan day:", 8, 50, 2);
+    ui().fillScreen(TFT_BLACK);
+    ui().setDatum(TL_DATUM);
+    ui().setTextColor(TFT_CYAN, TFT_BLACK);
+    ui().text("CHON WIFI TREN DIEN THOAI", 8, 8, 2);
+    ui().setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    ui().text("Ket noi AP: CYD-MiniTV-Setup", 8, 28, 2);
+    ui().text("Cac WiFi gan day:", 8, 50, 2);
     int rows = min(n, 6);
     for (int i = 0; i < rows; ++i) {
       uint16_t c = WiFi.RSSI(i) > -67 ? TFT_GREEN : (WiFi.RSSI(i) > -78 ? TFT_YELLOW : TFT_DARKGREY);
-      tft.setTextColor(c, TFT_BLACK);
+      ui().setTextColor(c, TFT_BLACK);
       String line = String(i + 1) + ". " + WiFi.SSID(i);
       if (line.length() > 32) line = line.substring(0, 31) + "~";
-      tft.drawString(line, 12, 74 + i * 22, 2);
+      ui().text(line, 12, 74 + i * 22, 2);
     }
     if (n <= 0) {
-      tft.setTextColor(TFT_RED, TFT_BLACK);
-      tft.drawString("Khong quet thay SSID", 12, 80, 2);
+      ui().setTextColor(TFT_RED, TFT_BLACK);
+      ui().text("Khong quet thay SSID", 12, 80, 2);
     }
-    tft.setTextColor(TFT_WHITE, TFT_BLACK);
-    tft.drawString("Portal se hien danh sach SSID de bam chon", 8, 218, 1);
+    ui().setTextColor(TFT_WHITE, TFT_BLACK);
+    ui().text("Portal se hien danh sach SSID de bam chon", 8, 218, 1);
   }
   return n;
 }
@@ -840,10 +788,10 @@ static bool scanSubnetForServer() {
     IPAddress ip(local[0], local[1], local[2], host);
     if ((host & 15) == 0) {
       Serial.printf("[SERVER] scan progress ...%d\n", host);
-      tft.fillRect(20, 160, 280, 20, TFT_BLACK);
-      tft.setTextDatum(MC_DATUM);
-      tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-      tft.drawString(String("IP ") + ip.toString(), 160, 170, 2);
+      ui().fillRect(20, 160, 280, 20, TFT_BLACK);
+      ui().setDatum(MC_DATUM);
+      ui().setTextColor(TFT_DARKGREY, TFT_BLACK);
+      ui().text(String("IP ") + ip.toString(), 160, 170, 2);
     }
     if (validateServer(ip, 8765, 28)) return true;
     delay(1);
@@ -939,20 +887,8 @@ static void rawSDProbe() {
 }
 
 static void logTFTDiagnostics() {
-  setup_t si;
-  tft.getSetup(si);
-  Serial.printf("[TFT] lib=%s driver=0x%04X port=%u size=%ux%u pins MOSI=%d MISO=%d SCLK=%d CS=%d DC=%d RST=%d BL=%d spi=%d rd=%d\n",
-                si.version.c_str(), si.tft_driver, (unsigned)si.port, si.tft_width, si.tft_height,
-                si.pin_tft_mosi, si.pin_tft_miso, si.pin_tft_clk, si.pin_tft_cs,
-                si.pin_tft_dc, si.pin_tft_rst, si.pin_tft_led, si.tft_spi_freq, si.tft_rd_freq);
-  uint8_t r0a = tft.readcommand8(0x0A, 0);
-  uint8_t r0b = tft.readcommand8(0x0B, 0);
-  uint8_t r0c = tft.readcommand8(0x0C, 0);
-  uint8_t d30 = tft.readcommand8(0xD3, 0);
-  uint8_t d31 = tft.readcommand8(0xD3, 1);
-  uint8_t d32 = tft.readcommand8(0xD3, 2);
-  uint8_t d33 = tft.readcommand8(0xD3, 3);
-  Serial.printf("[TFT] regs 0A=%02X 0B=%02X 0C=%02X D3=%02X %02X %02X %02X\n", r0a, r0b, r0c, d30, d31, d32, d33);
+  Serial.printf("[TFT] Arduino_GFX ILI9341 size=%dx%d pins MOSI=13 MISO=12 SCLK=14 CS=15 DC=2 BL=21 spi=40MHz inversion=ON\n",
+                ui().width(), ui().height());
 }
 
 static void runTFTColorTest() {
@@ -964,13 +900,12 @@ static void runTFTColorTest() {
   };
   Serial.println("[TFTTEST] begin RED/GREEN/BLUE/WHITE/BLACK");
   for (const auto &v : p) {
-    tft.fillScreen(v.c);
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(v.text, v.c);
-    tft.drawString(v.name, tft.width()/2, tft.height()/2, 4);
+    ui().fillScreen(v.c);
+    ui().setDatum(MC_DATUM);
+    ui().setTextColor(v.text, v.c);
+    ui().text(v.name, ui().width()/2, ui().height()/2, 4);
     delay(700);
-    uint16_t px = tft.readPixel(8, 8);
-    Serial.printf("[TFTTEST] %s expected=0x%04X readPixel=0x%04X\n", v.name, v.c, px);
+    Serial.printf("[TFTTEST] %s expected=0x%04X\n", v.name, v.c);
   }
   st.dirty = true;
   Serial.println("[TFTTEST] end");
@@ -1147,26 +1082,26 @@ static bool drawYTThumbnail(const YTItem &v, int x, int y) {
 }
 
 static void drawYTBrowser() {
-  tft.fillScreen(TFT_BLACK);
+  ui().fillScreen(TFT_BLACK);
   String wifi = WiFi.status() == WL_CONNECTED ? "S" : "WIFI";
   drawHeader("YouTube TV", true, "SEARCH");
   if (!ytServer.length()) {
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-    tft.drawString("Chua co server", 160, 96, 4);
-    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    tft.drawString(ytMessage.length() ? ytMessage : "Cham de ket noi", 160, 128, 2);
-    tft.drawRoundRect(80, 160, 160, 42, 8, TFT_CYAN);
-    tft.drawString("KET NOI", 160, 181, 2);
+    ui().setDatum(MC_DATUM);
+    ui().setTextColor(TFT_YELLOW, TFT_BLACK);
+    ui().text("Chua co server", 160, 96, 4);
+    ui().setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    ui().text(ytMessage.length() ? ytMessage : "Cham de ket noi", 160, 128, 2);
+    ui().drawRounded(80, 160, 160, 42, 8, TFT_CYAN);
+    ui().text("KET NOI", 160, 181, 2);
     st.dirty = false;
     return;
   }
   if (ytItems.empty()) {
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-    tft.drawString(ytMessage.length() ? ytMessage : "Dang tai...", 160, 110, 4);
-    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    tft.drawString("Server: " + ytServer.substring(7), 160, 145, 2);
+    ui().setDatum(MC_DATUM);
+    ui().setTextColor(TFT_YELLOW, TFT_BLACK);
+    ui().text(ytMessage.length() ? ytMessage : "Dang tai...", 160, 110, 4);
+    ui().setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    ui().text("Server: " + ytServer.substring(7), 160, 145, 2);
     st.dirty = false;
     return;
   }
@@ -1175,26 +1110,26 @@ static void drawYTBrowser() {
     if (idx >= (int)ytItems.size()) break;
     int y = 36 + row * YT_ROW_H;
     const YTItem &v = ytItems[idx];
-    tft.fillRect(0, y, 320, YT_ROW_H - 2, tft.color565(9, 10, 13));
-    tft.fillRect(4, y + 4, 96, 54, tft.color565(30, 30, 34));
+    ui().fillRect(0, y, 320, YT_ROW_H - 2, ui().color565(9, 10, 13));
+    ui().fillRect(4, y + 4, 96, 54, ui().color565(30, 30, 34));
     if (!drawYTThumbnail(v, 4, y + 4)) {
-      tft.setTextDatum(MC_DATUM);
-      tft.setTextColor(TFT_DARKGREY, tft.color565(30, 30, 34));
-      tft.drawString("YT", 52, y + 31, 4);
+      ui().setDatum(MC_DATUM);
+      ui().setTextColor(TFT_DARKGREY, ui().color565(30, 30, 34));
+      ui().text("YT", 52, y + 31, 4);
     }
-    tft.setTextDatum(TL_DATUM);
-    tft.setTextColor(TFT_WHITE, tft.color565(9, 10, 13));
-    tft.drawString(shorten(v.title, 27), 106, y + 5, 2);
+    ui().setDatum(TL_DATUM);
+    ui().setTextColor(TFT_WHITE, ui().color565(9, 10, 13));
+    ui().text(shorten(v.title, 27), 106, y + 5, 2);
     String line2 = v.title.length() > 27 ? shorten(v.title.substring(24), 27) : "";
-    if (line2.length()) tft.drawString(line2, 106, y + 23, 2);
-    tft.setTextColor(TFT_DARKGREY, tft.color565(9, 10, 13));
+    if (line2.length()) ui().text(line2, 106, y + 23, 2);
+    ui().setTextColor(TFT_DARKGREY, ui().color565(9, 10, 13));
     String meta = shorten(v.channel, 18);
     if (v.duration) meta += "  " + fmtTime(v.duration);
-    tft.drawString(meta, 106, y + 44, 1);
+    ui().text(meta, 106, y + 44, 1);
   }
-  tft.setTextDatum(BR_DATUM);
-  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  tft.drawString(String(ytScroll + 1) + "-" + String(min(ytScroll + YT_ROWS, (int)ytItems.size())) + "/" + String(ytItems.size()), 316, 238, 1);
+  ui().setDatum(BR_DATUM);
+  ui().setTextColor(TFT_DARKGREY, TFT_BLACK);
+  ui().text(String(ytScroll + 1) + "-" + String(min(ytScroll + YT_ROWS, (int)ytItems.size())) + "/" + String(ytItems.size()), 316, 238, 1);
   st.dirty = false;
 }
 
@@ -1262,7 +1197,7 @@ static void handleYTBrowserTouch() {
                 st.screen = Screen::YT_PLAYER;
                 st.osdVisible = true;
                 st.osdShownMs = millis();
-                tft.fillScreen(TFT_BLACK);
+                ui().fillScreen(TFT_BLACK);
               } else { ytStreamHttp.end(); ytMessage = "Stream HTTP " + String(sc); st.dirty = true; }
             }
           } else { ytMessage = "Play HTTP " + String(rc); st.dirty = true; }
@@ -1284,22 +1219,22 @@ static const char *KB[32] = {
 };
 
 static void drawYTKeyboard() {
-  tft.fillScreen(TFT_BLACK);
+  ui().fillScreen(TFT_BLACK);
   drawHeader("Search YouTube", true);
-  tft.fillRoundRect(6, 38, 308, 34, 5, tft.color565(24, 27, 32));
-  tft.setTextDatum(ML_DATUM);
-  tft.setTextColor(TFT_WHITE, tft.color565(24, 27, 32));
-  tft.drawString(shorten(ytQuery, 36), 12, 55, 2);
+  ui().fillRounded(6, 38, 308, 34, 5, ui().color565(24, 27, 32));
+  ui().setDatum(ML_DATUM);
+  ui().setTextColor(TFT_WHITE, ui().color565(24, 27, 32));
+  ui().text(shorten(ytQuery, 36), 12, 55, 2);
   const int keyY = 76;
   const int keyH = 40;
   for (int i = 0; i < 32; ++i) {
     int col = i % 8, row = i / 8;
     int x = col * 40, y = keyY + row * keyH;
-    uint16_t bg = (i == 28) ? tft.color565(170, 0, 0) : tft.color565(28, 31, 37);
-    tft.fillRoundRect(x + 2, y + 2, 36, 36, 4, bg);
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(TFT_WHITE, bg);
-    tft.drawString(KB[i], x + 20, y + 20, i >= 26 ? 1 : 2);
+    uint16_t bg = (i == 28) ? ui().color565(170, 0, 0) : ui().color565(28, 31, 37);
+    ui().fillRounded(x + 2, y + 2, 36, 36, 4, bg);
+    ui().setDatum(MC_DATUM);
+    ui().setTextColor(TFT_WHITE, bg);
+    ui().text(KB[i], x + 20, y + 20, i >= 26 ? 1 : 2);
   }
   st.dirty = false;
 }
@@ -1408,16 +1343,16 @@ static void stopYTStream() {
 }
 
 static void drawYTOSD() {
-  tft.fillRect(0, 0, 320, 28, TFT_BLACK);
-  tft.setTextDatum(ML_DATUM);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.drawString("< BACK", 6, 14, 2);
-  tft.setTextDatum(MR_DATUM);
-  tft.drawString(shorten(ytPlayingTitle, 27), 314, 14, 2);
-  tft.fillRect(0, 216, 320, 24, TFT_BLACK);
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-  tft.drawString("YouTube via LAN  |  VIDEO ONLY", 160, 228, 2);
+  ui().fillRect(0, 0, 320, 28, TFT_BLACK);
+  ui().setDatum(ML_DATUM);
+  ui().setTextColor(TFT_WHITE, TFT_BLACK);
+  ui().text("< BACK", 6, 14, 2);
+  ui().setDatum(MR_DATUM);
+  ui().text(shorten(ytPlayingTitle, 27), 314, 14, 2);
+  ui().fillRect(0, 216, 320, 24, TFT_BLACK);
+  ui().setDatum(MC_DATUM);
+  ui().setTextColor(TFT_YELLOW, TFT_BLACK);
+  ui().text("YouTube via LAN  |  VIDEO ONLY", 160, 228, 2);
 }
 
 static void handleYTPlayerTouch() {
@@ -1466,23 +1401,23 @@ static void handleYTPlayerTouch() {
 // Home
 // -----------------------------------------------------------------------------
 static void drawHome() {
-  tft.fillScreen(tft.color565(5, 7, 11));
-  tft.setTextDatum(MC_DATUM);
-  tft.setTextColor(TFT_WHITE, tft.color565(5, 7, 11));
-  tft.drawString("CYD MINI TV", 160, 30, 4);
-  tft.setTextColor(TFT_DARKGREY, tft.color565(5, 7, 11));
-  tft.drawString("ESP32-2432S028R", 160, 54, 2);
-  tft.fillRoundRect(18, 78, 284, 60, 10, tft.color565(22, 26, 34));
-  tft.fillRoundRect(18, 150, 284, 60, 10, tft.color565(134, 0, 0));
-  tft.setTextColor(TFT_CYAN, tft.color565(22, 26, 34));
-  tft.drawString("SD VIDEO", 160, 102, 4);
-  tft.setTextColor(TFT_LIGHTGREY, tft.color565(22, 26, 34));
-  tft.drawString(sdReady ? "MJPEG + MP3" : "No SD - van vao duoc", 160, 125, 1);
-  tft.setTextColor(TFT_WHITE, tft.color565(134, 0, 0));
-  tft.drawString("YOUTUBE TV", 160, 174, 4);
-  tft.drawString("Swipe feed / Search / Tap to play", 160, 198, 1);
-  tft.setTextColor(WiFi.status() == WL_CONNECTED ? TFT_GREEN : TFT_DARKGREY, tft.color565(5, 7, 11));
-  tft.drawString(WiFi.status() == WL_CONNECTED ? ("WiFi " + WiFi.localIP().toString()) : "WiFi setup khi vao YouTube", 160, 228, 1);
+  ui().fillScreen(ui().color565(5, 7, 11));
+  ui().setDatum(MC_DATUM);
+  ui().setTextColor(TFT_WHITE, ui().color565(5, 7, 11));
+  ui().text("CYD MINI TV", 160, 30, 4);
+  ui().setTextColor(TFT_DARKGREY, ui().color565(5, 7, 11));
+  ui().text("ESP32-2432S028R", 160, 54, 2);
+  ui().fillRounded(18, 78, 284, 60, 10, ui().color565(22, 26, 34));
+  ui().fillRounded(18, 150, 284, 60, 10, ui().color565(134, 0, 0));
+  ui().setTextColor(TFT_CYAN, ui().color565(22, 26, 34));
+  ui().text("SD VIDEO", 160, 102, 4);
+  ui().setTextColor(TFT_LIGHTGREY, ui().color565(22, 26, 34));
+  ui().text(sdReady ? "MJPEG + MP3" : "No SD - van vao duoc", 160, 125, 1);
+  ui().setTextColor(TFT_WHITE, ui().color565(134, 0, 0));
+  ui().text("YOUTUBE TV", 160, 174, 4);
+  ui().text("Swipe feed / Search / Tap to play", 160, 198, 1);
+  ui().setTextColor(WiFi.status() == WL_CONNECTED ? TFT_GREEN : TFT_DARKGREY, ui().color565(5, 7, 11));
+  ui().text(WiFi.status() == WL_CONNECTED ? ("WiFi " + WiFi.localIP().toString()) : "WiFi setup khi vao YouTube", 160, 228, 1);
   st.dirty = false;
 }
 

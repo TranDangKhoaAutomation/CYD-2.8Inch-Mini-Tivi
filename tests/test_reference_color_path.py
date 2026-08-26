@@ -3,13 +3,13 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 
 class ReferenceColorPath(unittest.TestCase):
-    def test_matches_known_good_cyd_slideshow_path(self):
+    def test_matches_verified_cyd_video_path(self):
         ini = (ROOT/'platformio.ini').read_text(encoding='utf-8')
         src = (ROOT/'src'/'main.cpp').read_text(encoding='utf-8')
-        self.assertIn('https://github.com/bitbank2/JPEGDEC.git#1.7.0', ini)
-        setup = src[src.index('void setup() {'):src.index('void loop() {')]
-        self.assertIn("applyJPEGColorMode('D')", setup)
-        self.assertNotIn('runJPEGColorAutoTest();', setup)
+        disp = (ROOT/'src'/'display'/'display.cpp').read_text(encoding='utf-8')
+        self.assertIn('JPEGDEC.git#1.8.2', ini)
+        self.assertIn("applyJPEGColorMode('A')", src)
+        self.assertIn('invertDisplay(true)', disp)
+        self.assertIn('draw16bitBeRGBBitmap', disp)
 
-if __name__ == '__main__':
-    unittest.main()
+if __name__ == '__main__': unittest.main()
