@@ -1,77 +1,121 @@
-// ============================================================================
-//  Open CYD Player — open-source MJPEG + MP3 video player for the
-//  ESP32-2432S028R "Cheap Yellow Display" (2.8" resistive touch)
-//
-//  Media layout on FAT32 SD card:
-//    /videos/movie.mjpeg   concatenated JPEG frames (320x240)
-//    /videos/movie.mp3     matching audio track (same basename)
-//    /videos/movie.idx     frame index (see tools/convert.py) — enables seeking
-//
-//  License: MIT
-// ============================================================================
-
 #include <Arduino.h>
 #include <SPI.h>
 #include <SD.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <HTTPClient.h>
+#include <WiFiManager.h>
+#include <ArduinoJson.h>
+#include <Preferences.h>
 #include <TFT_eSPI.h>
 #include <JPEGDEC.h>
-#include <XPT2046_Touchscreen.h>
-#include "Audio.h"          // ESP32-audioI2S
+#include "color_test_jpeg.h"
 #include "config.h"
 
-// ---------------------------------------------------------------------------
-// Globals
-// ---------------------------------------------------------------------------
+#include <vector>
+#include <functional>
+
 TFT_eSPI tft;
 JPEGDEC jpeg;
-SPIClass touchSPI(HSPI);
-XPT2046_Touchscreen touch(TOUCH_CS, TOUCH_IRQ);
-Audio audio;
+SPIClass sdSPI(VSPI);
 
-// ---- IDX file format (little-endian) ----
-// char magic[4] = "CYD1"
-// uint32 fps_milli      (fps * 1000, e.g. 30000 = 30.000 fps)
-// uint32 frame_count
-// uint32 offsets[frame_count + 1]   (last entry = file size)
+static constexpr uint16_t DISCOVERY_SERVER_PORT = 4210;
+static constexpr uint16_t DISCOVERY_LOCAL_PORT  = 4211;
+static constexpr int YT_ROWS = 3;
+static constexpr int YT_ROW_H = 66;
+
 struct VideoIndex {
-  float    fps = 30.0f;
+  float fps = 30.0f;
   uint32_t frames = 0;
-  uint32_t *offsets = nullptr;   // frames+1 entries, heap (PSRAM-less boards: ~4B/frame)
-  bool     valid = false;
+  File idxFile;
+  bool valid = false;
 };
 
-enum class Screen { BROWSER, PLAYER };
+enum class Screen {
+  HOME,
+  SD_BROWSER,
+  SD_PLAYER,
+  YT_BROWSER,
+  YT_KEYBOARD,
+  YT_PLAYER
+};
 
 struct PlayerState {
-  Screen   screen        = Screen::BROWSER;
-  String   basePath;                 // "/videos/movie" (no extension)
-  File     vfile;
+  Screen screen = Screen::HOME;
+  String basePath;
+  File vfile;
   VideoIndex idx;
-  uint32_t frame         = 0;
-  bool     playing       = false;
-  bool     hasAudio      = false;
-  uint32_t startMs       = 0;        // wall-clock anchor for frame pacing
-  uint32_t pausedAtMs    = 0;
-  bool     osdVisible    = true;
-  uint32_t osdShownMs    = 0;
-  uint8_t  volume        = DEFAULT_VOLUME;
-  uint8_t  brightness    = DEFAULT_BRIGHT;
-  bool     dirty         = true;     // browser needs redraw
-  int      browserPage   = 0;
+  uint32_t frame = 0;
+  bool playing = false;
+  bool hasAudio = false;
+  uint32_t startMs = 0;
+  uint32_t pausedAtMs = 0;
+  bool osdVisible = true;
+  uint32_t osdShownMs = 0;
+  uint8_t volume = DEFAULT_VOLUME;
+  uint8_t brightness = DEFAULT_BRIGHT;
+  bool dirty = true;
+  int browserPage = 0;
 } st;
 
+struct YTItem {
+  String id;
+  String url;
+  String title;
+  String channel;
+  uint32_t duration = 0;
+};
+
+static bool sdReady = false;
 static uint8_t *frameBuf = nullptr;
-static size_t   frameBufSize = 0;
+static size_t frameBufSize = 0;
+static std::vector<String> videoList;
+static std::vector<YTItem> ytItems;
+static int ytScroll = 0;
+static String ytQuery = "music technology robots";
+static String ytServer;
+static String ytMessage;
+static String ytPlayingTitle;
+static bool ytFeedLoading = false;
+static bool ytStreamActive = false;
+static HTTPClient ytStreamHttp;
+static WiFiClient *ytStreamClient = nullptr;
+static WiFiUDP discoveryUdp;
 
-std::vector<String> videoList;      // basenames without extension
+// Persistent MJPEG parser state. Must survive short Wi-Fi gaps between loop() calls.
+static bool ytParserInJpeg = false;
+static int ytParserPrev = -1;
+static size_t ytParserN = 0;
+static uint32_t ytParserLastByteMs = 0;
 
-// Audio runs on its own task/core so video decode never starves it
-TaskHandle_t audioTaskHandle = nullptr;
-SemaphoreHandle_t audioMutex;
+// Runtime diagnostics. touchDebugUntil enables bounded raw/calibrated touch logging.
+static uint32_t touchDebugUntil = 0;
+static uint32_t touchLastLogMs = 0;
 
-// ---------------------------------------------------------------------------
-// Small helpers
-// ---------------------------------------------------------------------------
+// JPEG byte-order diagnostic matrix:
+// A=BIG/swap0, B=BIG/swap1, C=LITTLE/swap0, D=LITTLE/swap1.
+// D is the default because JPEGDEC native RGB565 + TFT_eSPI byte swap is the
+// normal path for a 16-bit SPI panel. It can be changed at runtime via UART.
+static char jpegColorMode = 'D';
+static int jpegPixelType = RGB565_LITTLE_ENDIAN;
+static bool jpegSwapBytes = true;
+static bool jpegSwapRB = true;  // software R<->B correction for decoded JPEG RGB565
+
+// YouTube stream runtime metrics.
+static uint32_t ytStatsStartMs = 0;
+static uint32_t ytFramesRx = 0, ytFramesDecoded = 0, ytFramesDropped = 0;
+static uint64_t ytJpegBytes = 0, ytDecodeUs = 0, ytRenderUs = 0;
+static bool ytDecodeInProgress = false;
+
+static bool ensureBuf(size_t n) {
+  if (n <= frameBufSize) return true;
+  uint8_t *nb = (uint8_t *)realloc(frameBuf, n);
+  if (!nb) return false;
+  frameBuf = nb;
+  frameBufSize = n;
+  return true;
+}
+
 static void setBrightness(uint8_t v) {
   st.brightness = v;
   ledcWrite(BL_CHANNEL, v);
@@ -88,70 +132,265 @@ static String fmtTime(uint32_t sec) {
   return String(b);
 }
 
-// ---------------------------------------------------------------------------
-// JPEG draw callback -> push decoded MCU block straight to the display
-// ---------------------------------------------------------------------------
+static String shorten(const String &s, size_t n) {
+  if (s.length() <= n) return s;
+  return s.substring(0, n > 3 ? n - 3 : n) + "...";
+}
+
+static inline uint16_t swapRB565(uint16_t c) {
+  return (uint16_t)(((c & 0x001Fu) << 11) | (c & 0x07E0u) | ((c & 0xF800u) >> 11));
+}
+
 static int jpegDraw(JPEGDRAW *p) {
-  tft.pushImage(p->x, p->y, p->iWidth, p->iHeight, (uint16_t *)p->pPixels);
+  uint32_t t0 = ytDecodeInProgress ? micros() : 0;
+  uint16_t *pixels = (uint16_t *)p->pPixels;
+  if (jpegSwapRB) {
+    const int count = p->iWidth * p->iHeight;
+    for (int i = 0; i < count; ++i) pixels[i] = swapRB565(pixels[i]);
+  }
+  tft.pushImage(p->x, p->y, p->iWidth, p->iHeight, pixels);
+  if (ytDecodeInProgress) ytRenderUs += (uint32_t)(micros() - t0);
   return 1;
 }
 
-// ---------------------------------------------------------------------------
-// Index loading
-// ---------------------------------------------------------------------------
-static bool loadIndex(const String &base, VideoIndex &ix) {
-  ix.valid = false;
-  if (ix.offsets) { free(ix.offsets); ix.offsets = nullptr; }
-
-  File f = SD.open(base + ".idx", FILE_READ);
-  if (!f) return false;
-
-  char magic[4];
-  if (f.read((uint8_t *)magic, 4) != 4 || memcmp(magic, "CYD1", 4) != 0) { f.close(); return false; }
-
-  uint32_t fpsMilli = 0;
-  f.read((uint8_t *)&fpsMilli, 4);
-  f.read((uint8_t *)&ix.frames, 4);
-  if (fpsMilli < 1000 || fpsMilli > 60000 || ix.frames == 0 || ix.frames > 2000000) { f.close(); return false; }
-
-  ix.offsets = (uint32_t *)malloc((ix.frames + 1) * sizeof(uint32_t));
-  if (!ix.offsets) { f.close(); return false; }
-
-  size_t want = (ix.frames + 1) * sizeof(uint32_t);
-  if (f.read((uint8_t *)ix.offsets, want) != (int)want) {
-    free(ix.offsets); ix.offsets = nullptr; f.close(); return false;
+static void applyJPEGColorMode(char mode) {
+  mode = (char)toupper((unsigned char)mode);
+  if (mode < 'A' || mode > 'D') mode = 'D';
+  jpegColorMode = mode;
+  switch (mode) {
+    case 'A': jpegPixelType = RGB565_BIG_ENDIAN;    jpegSwapBytes = false; break;
+    case 'B': jpegPixelType = RGB565_BIG_ENDIAN;    jpegSwapBytes = true;  break;
+    case 'C': jpegPixelType = RGB565_LITTLE_ENDIAN; jpegSwapBytes = false; break;
+    default:  jpegPixelType = RGB565_LITTLE_ENDIAN; jpegSwapBytes = true;  break;
   }
-  f.close();
-  ix.fps = fpsMilli / 1000.0f;
-  ix.valid = true;
+  tft.setSwapBytes(jpegSwapBytes);
+  Serial.printf("[COLOR] mode=%c jpeg=%s tftSwap=%d\n", jpegColorMode,
+                jpegPixelType == RGB565_BIG_ENDIAN ? "BIG" : "LITTLE", jpegSwapBytes ? 1 : 0);
+}
+
+static inline void prepareJPEGDecode() {
+  tft.setSwapBytes(jpegSwapBytes);
+  jpeg.setPixelType(jpegPixelType);
+}
+
+
+static uint32_t rgb565Error(uint16_t got, uint16_t expected) {
+  int gr = (got >> 11) & 0x1F, gg = (got >> 5) & 0x3F, gb = got & 0x1F;
+  int er = (expected >> 11) & 0x1F, eg = (expected >> 5) & 0x3F, eb = expected & 0x1F;
+  return (uint32_t)(abs(gr - er) * 2 + abs(gg - eg) + abs(gb - eb) * 2);
+}
+
+static char runJPEGColorAutoTest() {
+  const int sampleX[5] = {32, 96, 160, 224, 288};
+  const uint16_t expected[5] = {TFT_RED, TFT_GREEN, TFT_BLUE, TFT_WHITE, TFT_BLACK};
+  const char modes[4] = {'A', 'B', 'C', 'D'};
+  uint32_t bestScore = 0xFFFFFFFFu;
+  char bestMode = 'A';
+
+  Serial.println("[COLORAUTO] begin reference JPEG RGB565 test");
+  for (char mode : modes) {
+    applyJPEGColorMode(mode);
+    tft.fillScreen(TFT_BLACK);
+    bool opened = jpeg.openRAM((uint8_t *)kColorCalJpeg, kColorCalJpegLen, jpegDraw);
+    if (!opened) {
+      Serial.printf("[COLORAUTO] mode=%c openRAM failed err=%d\n", mode, jpeg.getLastError());
+      continue;
+    }
+    prepareJPEGDecode();
+    int decOk = jpeg.decode(0, 70, 0);
+    jpeg.close();
+    delay(8);
+    if (!decOk) {
+      Serial.printf("[COLORAUTO] mode=%c decode failed\n", mode);
+      continue;
+    }
+
+    uint32_t score = 0;
+    Serial.printf("[COLORAUTO] mode=%c pixels", mode);
+    for (int i = 0; i < 5; ++i) {
+      uint16_t got = tft.readPixel(sampleX[i], 110);
+      score += rgb565Error(got, expected[i]);
+      Serial.printf(" %04X", got);
+    }
+    Serial.printf(" score=%lu\n", (unsigned long)score);
+    if (score < bestScore) {
+      bestScore = score;
+      bestMode = mode;
+    }
+  }
+
+  // JPEGDEC's own SPI-LCD helper uses BIG_ENDIAN; use A as a safe fallback
+  // if panel readback is unavailable or all results are implausible.
+  if (bestScore == 0xFFFFFFFFu || bestScore > 500u) {
+    Serial.printf("[COLORAUTO] readback unreliable score=%lu; fallback=A\n", (unsigned long)bestScore);
+    bestMode = 'A';
+  }
+  applyJPEGColorMode(bestMode);
+  Serial.printf("[COLORAUTO] selected=%c score=%lu\n", bestMode, (unsigned long)bestScore);
+  tft.fillScreen(TFT_BLACK);
+  st.dirty = true;
+  return bestMode;
+}
+
+static uint16_t touchRead12(uint8_t cmd) {
+  uint16_t raw = 0;
+  digitalWrite(TOUCH_CS, LOW);
+  for (int i = 7; i >= 0; --i) {
+    digitalWrite(TOUCH_DIN, (cmd >> i) & 1);
+    digitalWrite(TOUCH_CLK, HIGH);
+    delayMicroseconds(1);
+    digitalWrite(TOUCH_CLK, LOW);
+    delayMicroseconds(1);
+  }
+  // XPT2046 clocks a 16-bit word: 1 null bit + 12 ADC bits + 3 trailing bits.
+  for (int i = 15; i >= 0; --i) {
+    digitalWrite(TOUCH_CLK, HIGH);
+    delayMicroseconds(1);
+    raw |= (uint16_t)digitalRead(TOUCH_DO) << i;
+    digitalWrite(TOUCH_CLK, LOW);
+    delayMicroseconds(1);
+  }
+  digitalWrite(TOUCH_CS, HIGH);
+  return (raw >> 3) & 0x0FFF;
+}
+
+static bool readTouch(int &x, int &y) {
+  // IRQ is active LOW on XPT2046. It is a real hardware indication and avoids
+  // mistaking idle ADC values for touches.
+  if (digitalRead(TOUCH_IRQ) != LOW) return false;
+
+  // Median-of-3 style averaging reduces resistive touch jitter.
+  uint32_t sx = 0, sy = 0;
+  for (int i = 0; i < 3; ++i) {
+    sy += touchRead12(0x90); // raw Y
+    sx += touchRead12(0xD0); // raw X
+  }
+  int rawX = (int)(sx / 3);
+  int rawY = (int)(sy / 3);
+  if (rawX < 50 || rawY < 50) return false;
+
+  x = map(rawY, TOUCH_Y_MIN, TOUCH_Y_MAX, 0, tft.width());
+  y = map(rawX, TOUCH_X_MIN, TOUCH_X_MAX, tft.height(), 0);
+  x = constrain(x, 0, tft.width() - 1);
+  y = constrain(y, 0, tft.height() - 1);
+  if ((int32_t)(touchDebugUntil - millis()) > 0 && millis() - touchLastLogMs >= 80) {
+    touchLastLogMs = millis();
+    Serial.printf("[TOUCH] rawX=%d rawY=%d x=%d y=%d irq=%d\n", rawX, rawY, x, y, digitalRead(TOUCH_IRQ));
+  }
   return true;
 }
 
-// ---------------------------------------------------------------------------
-// Audio task (core 0). audio.loop() must be called constantly while playing.
-// ---------------------------------------------------------------------------
-static void audioTask(void *) {
-  for (;;) {
-    if (xSemaphoreTake(audioMutex, portMAX_DELAY) == pdTRUE) {
-      audio.loop();
-      xSemaphoreGive(audioMutex);
+static void drawHeader(const String &title, bool back, const String &right = "") {
+  tft.fillRect(0, 0, tft.width(), 34, tft.color565(14, 16, 20));
+  tft.setTextDatum(ML_DATUM);
+  if (back) {
+    tft.setTextColor(TFT_CYAN, tft.color565(14, 16, 20));
+    tft.drawString("<", 8, 17, 4);
+  }
+  tft.setTextColor(TFT_WHITE, tft.color565(14, 16, 20));
+  tft.drawString(title, back ? 38 : 10, 17, 2);
+  if (right.length()) {
+    tft.setTextDatum(MR_DATUM);
+    tft.setTextColor(TFT_YELLOW, tft.color565(14, 16, 20));
+    tft.drawString(right, tft.width() - 8, 17, 2);
+  }
+  tft.drawFastHLine(0, 33, tft.width(), tft.color565(40, 44, 52));
+}
+
+// -----------------------------------------------------------------------------
+// SD playback (kept from Open CYD Player)
+// -----------------------------------------------------------------------------
+static bool readIndexOffset(VideoIndex &ix, uint32_t frame, uint32_t &offset) {
+  if (!ix.valid || !ix.idxFile || frame > ix.frames) return false;
+  uint32_t pos = 12u + frame * sizeof(uint32_t);
+  if (!ix.idxFile.seek(pos)) return false;
+  return ix.idxFile.read((uint8_t *)&offset, sizeof(offset)) == sizeof(offset);
+}
+
+static bool loadIndex(const String &base, VideoIndex &ix) {
+  ix.valid = false;
+  ix.frames = 0;
+  if (ix.idxFile) ix.idxFile.close();
+
+  ix.idxFile = SD.open(base + ".idx", FILE_READ);
+  if (!ix.idxFile) {
+    Serial.printf("[SD][IDX] open failed: %s.idx\n", base.c_str());
+    return false;
+  }
+
+  char magic[4];
+  uint32_t fpsMilli = 0;
+  uint32_t frames = 0;
+  if (ix.idxFile.read((uint8_t *)magic, 4) != 4 || memcmp(magic, "CYD1", 4) != 0 ||
+      ix.idxFile.read((uint8_t *)&fpsMilli, 4) != 4 ||
+      ix.idxFile.read((uint8_t *)&frames, 4) != 4) {
+    Serial.println("[SD][IDX] invalid/truncated header");
+    ix.idxFile.close();
+    return false;
+  }
+  if (fpsMilli < 1000 || fpsMilli > 60000 || frames == 0 || frames > 2000000) {
+    Serial.printf("[SD][IDX] invalid header fpsMilli=%lu frames=%lu\n",
+                  (unsigned long)fpsMilli, (unsigned long)frames);
+    ix.idxFile.close();
+    return false;
+  }
+
+  uint64_t expectedSize = 12ULL + ((uint64_t)frames + 1ULL) * sizeof(uint32_t);
+  if ((uint64_t)ix.idxFile.size() != expectedSize) {
+    Serial.printf("[SD][IDX] size mismatch got=%lu expected=%llu\n",
+                  (unsigned long)ix.idxFile.size(), (unsigned long long)expectedSize);
+    ix.idxFile.close();
+    return false;
+  }
+
+  ix.fps = fpsMilli / 1000.0f;
+  ix.frames = frames;
+  ix.valid = true;
+  Serial.printf("[SD][IDX] streaming index enabled frames=%lu fps=%.2f idxBytes=%lu heap=%u largest=%u\n",
+                (unsigned long)ix.frames, ix.fps, (unsigned long)ix.idxFile.size(),
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  return true;
+}
+
+static bool validateIndexAgainstMedia(VideoIndex &ix, uint32_t fileSize) {
+  if (!ix.valid || !ix.idxFile || ix.frames == 0) return false;
+  if (!ix.idxFile.seek(12)) return false;
+
+  uint32_t prev = 0;
+  if (ix.idxFile.read((uint8_t *)&prev, sizeof(prev)) != sizeof(prev) || prev != 0) {
+    Serial.printf("[SD][IDX] first offset invalid=%lu\n", (unsigned long)prev);
+    return false;
+  }
+
+  for (uint32_t i = 1; i <= ix.frames; ++i) {
+    uint32_t cur = 0;
+    if (ix.idxFile.read((uint8_t *)&cur, sizeof(cur)) != sizeof(cur)) {
+      Serial.printf("[SD][IDX] truncated at offset #%lu\n", (unsigned long)i);
+      return false;
     }
-    vTaskDelay(1);
+    if (cur <= prev || cur > fileSize) {
+      Serial.printf("[SD][IDX] invalid offset i=%lu prev=%lu cur=%lu media=%lu\n",
+                    (unsigned long)i, (unsigned long)prev, (unsigned long)cur, (unsigned long)fileSize);
+      return false;
+    }
+    prev = cur;
   }
+
+  if (prev != fileSize) {
+    Serial.printf("[SD][IDX] sentinel invalid=%lu media=%lu\n",
+                  (unsigned long)prev, (unsigned long)fileSize);
+    return false;
+  }
+  return true;
 }
 
-static void audioCmd(std::function<void()> fn) {
-  if (xSemaphoreTake(audioMutex, portMAX_DELAY) == pdTRUE) {
-    fn();
-    xSemaphoreGive(audioMutex);
-  }
+static void invalidateIndex(VideoIndex &ix) {
+  if (ix.idxFile) ix.idxFile.close();
+  ix.valid = false;
+  ix.frames = 0;
 }
 
-// ---------------------------------------------------------------------------
-// Playback control
-// ---------------------------------------------------------------------------
 static void syncClockToFrame() {
-  // Re-anchor wall clock so `frame` is "now"
   st.startMs = millis() - (uint32_t)(st.frame * 1000.0f / st.idx.fps);
 }
 
@@ -159,96 +398,79 @@ static void seekToFrame(uint32_t frame) {
   if (!st.idx.valid) return;
   if (frame >= st.idx.frames) frame = st.idx.frames - 1;
   st.frame = frame;
-  st.vfile.seek(st.idx.offsets[frame]);
+  uint32_t off = 0;
+  if (!readIndexOffset(st.idx, frame, off)) return;
+  st.vfile.seek(off);
   syncClockToFrame();
-  if (st.hasAudio) {
-    uint32_t sec = (uint32_t)(frame / st.idx.fps);
-    audioCmd([sec] { audio.setAudioPlayPosition(sec); });
-  }
 }
 
 static void setPlaying(bool p) {
   if (p == st.playing) return;
   st.playing = p;
   if (p) {
-    // resume: shift anchor by pause duration
     st.startMs += millis() - st.pausedAtMs;
-    if (st.hasAudio) audioCmd([] { audio.pauseResume(); });
   } else {
     st.pausedAtMs = millis();
-    if (st.hasAudio) audioCmd([] { audio.pauseResume(); });
   }
   showOsd();
 }
 
-static void stopPlayback() {
-  if (st.hasAudio) audioCmd([] { audio.stopSong(); });
+static void stopSDPlayback() {
   if (st.vfile) st.vfile.close();
-  if (st.idx.offsets) { free(st.idx.offsets); st.idx.offsets = nullptr; st.idx.valid = false; }
-  st.screen = Screen::BROWSER;
+  invalidateIndex(st.idx);
+  st.hasAudio = false;
+  st.playing = false;
+  st.screen = Screen::SD_BROWSER;
   st.dirty = true;
 }
 
-static bool startPlayback(const String &base) {
-  stopPlayback();
-
+static bool startSDPlayback(const String &base) {
+  Serial.printf("[SD][PLAY] base=%s\n", base.c_str());
+  if (st.vfile) st.vfile.close();
+  invalidateIndex(st.idx);
   st.vfile = SD.open(base + ".mjpeg", FILE_READ);
-  if (!st.vfile) return false;
-
-  if (!loadIndex(base, st.idx)) {
-    // No index: fall back to a fake single-chunk index at 30fps (no seeking)
+  if (!st.vfile) { Serial.printf("[SD][PLAY] open failed: %s.mjpeg\n", base.c_str()); return false; }
+  bool idxLoaded = loadIndex(base, st.idx);
+  if (idxLoaded && !validateIndexAgainstMedia(st.idx, (uint32_t)st.vfile.size())) {
+    Serial.printf("[SD][PLAY] idx structure invalid: %s.idx; fallback scan mode\n", base.c_str());
+    invalidateIndex(st.idx);
+    idxLoaded = false;
+  }
+  if (!idxLoaded) {
+    Serial.printf("[SD][PLAY] idx missing/invalid: %s.idx; fallback scan mode\n", base.c_str());
     st.idx.fps = 30.0f;
-    st.idx.frames = 0;               // frames==0 => stream-parse mode
+    st.idx.frames = 0;
     st.idx.valid = false;
   }
-
-  st.hasAudio = SD.exists(base + ".mp3");
-  if (st.hasAudio) {
-    String mp3 = base + ".mp3";
-    audioCmd([mp3] {
-      audio.setVolume(st.volume);
-      audio.connecttoFS(SD, mp3.c_str());
-    });
-  }
-
+  st.hasAudio = false;  // Wi-Fi-first build: audio disabled for now
   st.basePath = base;
   st.frame = 0;
   st.playing = true;
   st.startMs = millis();
-  st.screen = Screen::PLAYER;
+  st.screen = Screen::SD_PLAYER;
   tft.fillScreen(TFT_BLACK);
   showOsd();
+  Serial.printf("[SD][PLAY] started size=%u idx=%d fps=%.2f frames=%u\n",
+                (unsigned)st.vfile.size(), st.idx.valid ? 1 : 0, st.idx.fps, (unsigned)st.idx.frames);
   return true;
 }
 
-// ---------------------------------------------------------------------------
-// Frame reading
-//   Indexed mode: exact offsets from .idx
-//   Stream mode (no .idx): scan for JPEG SOI/EOI markers (slower, no seek)
-// ---------------------------------------------------------------------------
-static bool ensureBuf(size_t n) {
-  if (n <= frameBufSize) return true;
-  uint8_t *nb = (uint8_t *)realloc(frameBuf, n);
-  if (!nb) return false;
-  frameBuf = nb;
-  frameBufSize = n;
-  return true;
-}
-
-static int readNextFrame() {          // returns frame byte length, 0 = EOF, -1 = error
+static int readNextSDFrame() {
   if (st.idx.valid) {
     if (st.frame >= st.idx.frames) return 0;
-    uint32_t off = st.idx.offsets[st.frame];
-    uint32_t len = st.idx.offsets[st.frame + 1] - off;
+    uint32_t off = 0, next = 0;
+    if (!readIndexOffset(st.idx, st.frame, off) ||
+        !readIndexOffset(st.idx, st.frame + 1, next) || next <= off) {
+      Serial.printf("[SD][IDX] read failed frame=%lu\n", (unsigned long)st.frame);
+      return -1;
+    }
+    uint32_t len = next - off;
     if (!ensureBuf(len)) return -1;
-    st.vfile.seek(off);
+    if (!st.vfile.seek(off)) return -1;
     if (st.vfile.read(frameBuf, len) != (int)len) return -1;
     return (int)len;
   }
-
-  // ---- stream-parse fallback ----
   if (!ensureBuf(64 * 1024)) return -1;
-  // find SOI 0xFFD8
   int b, prev = -1;
   while ((b = st.vfile.read()) >= 0) {
     if (prev == 0xFF && b == 0xD8) break;
@@ -267,36 +489,24 @@ static int readNextFrame() {          // returns frame byte length, 0 = EOF, -1 
   return 0;
 }
 
-// ---------------------------------------------------------------------------
-// OSD (on-screen controls)
-// ---------------------------------------------------------------------------
-static void drawOsd() {
+static void drawSDOsd() {
   const int W = tft.width(), H = tft.height();
-
-  // top bar: filename + time
-  tft.fillRect(0, 0, W, 22, tft.color565(0, 0, 0));
+  tft.fillRect(0, 0, W, 22, TFT_BLACK);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.setTextDatum(TL_DATUM);
   String name = st.basePath.substring(st.basePath.lastIndexOf('/') + 1);
-  tft.drawString(name, 4, 4, 2);
-
+  tft.drawString(shorten(name, 22), 4, 4, 2);
   uint32_t curSec = (uint32_t)(st.frame / st.idx.fps);
   uint32_t totSec = st.idx.valid ? (uint32_t)(st.idx.frames / st.idx.fps) : 0;
   tft.setTextDatum(TR_DATUM);
   tft.drawString(fmtTime(curSec) + " / " + fmtTime(totSec), W - 4, 4, 2);
-
-  // bottom bar: progress + buttons
   int barY = H - 46;
   tft.fillRect(0, barY, W, 46, TFT_BLACK);
-
-  // progress
   tft.drawRect(8, barY + 4, W - 16, 8, TFT_DARKGREY);
   if (st.idx.valid && st.idx.frames) {
     int fill = (int)((uint64_t)(W - 18) * st.frame / st.idx.frames);
     tft.fillRect(9, barY + 5, fill, 6, TFT_YELLOW);
   }
-
-  // buttons:  [back]  [-1m]  [play/pause]  [+1m]
   tft.setTextDatum(MC_DATUM);
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.drawString("BACK", 34, barY + 30, 2);
@@ -306,89 +516,58 @@ static void drawOsd() {
   tft.drawString("VOL " + String(st.volume), W - 34, barY + 30, 2);
 }
 
-// ---------------------------------------------------------------------------
-// Touch mapping (rotation 1: landscape 320x240)
-// ---------------------------------------------------------------------------
-static bool readTouch(int &x, int &y) {
-  if (!touch.touched()) return false;
-  TS_Point p = touch.getPoint();
-  // map raw -> screen, rotated for landscape
-  x = map(p.y, TOUCH_Y_MIN, TOUCH_Y_MAX, 0, tft.width());
-  y = map(p.x, TOUCH_X_MIN, TOUCH_X_MAX, tft.height(), 0);
-  x = constrain(x, 0, tft.width() - 1);
-  y = constrain(y, 0, tft.height() - 1);
-  return true;
-}
-
-// Edge-drag gestures: left edge = brightness, right edge = volume
-static void handlePlayerTouch() {
+static void handleSDPlayerTouch() {
   static bool wasDown = false;
   static int downX = 0, downY = 0;
   static uint32_t downMs = 0;
   static bool dragging = false;
-
   int x, y;
   bool down = readTouch(x, y);
   const int W = tft.width(), H = tft.height();
-
-  if (down && !wasDown) {            // press
-    downX = x; downY = y; downMs = millis(); dragging = false;
-  }
-
-  if (down && wasDown) {             // drag
-    int dy = downY - y;              // up = positive
+  if (down && !wasDown) { downX = x; downY = y; downMs = millis(); dragging = false; }
+  if (down && wasDown) {
+    int dy = downY - y;
     if (!dragging && abs(dy) > 18 && (downX < 48 || downX > W - 48)) dragging = true;
     if (dragging) {
-      if (downX < 48) {              // brightness
-        int nb = constrain(st.brightness + dy / 2, 8, 255);
+      if (downX < 48) {
+        int nb = constrain(st.brightness + dy / 2, 96, 255);
         setBrightness(nb);
-      } else {                       // volume
+      } else {
         int nv = constrain(st.volume + dy / 24, 0, 21);
-        if (nv != st.volume) {
-          st.volume = nv;
-          audioCmd([] { audio.setVolume(st.volume); });
-        }
+        if (nv != st.volume) st.volume = nv;
       }
-      downY = y;                     // incremental
+      downY = y;
       showOsd();
     }
   }
-
-  if (!down && wasDown && !dragging) {   // tap released
+  if (!down && wasDown && !dragging) {
     uint32_t heldMs = millis() - downMs;
     if (heldMs < 600) {
       int barY = H - 46;
-      if (!st.osdVisible) {
-        showOsd();
-      } else if (downY >= barY) {
-        // progress bar tap -> seek
+      if (downX < 72 && downY < 46) {
+        Serial.println("[TOUCH] SD BACK top-left");
+        stopSDPlayback();
+      } else if (!st.osdVisible) showOsd();
+      else if (downY >= barY) {
         if (downY < barY + 16 && st.idx.valid) {
           uint32_t f = (uint64_t)st.idx.frames * constrain(downX - 8, 0, W - 16) / (W - 16);
           seekToFrame(f);
-        } else if (downX < 68) {
-          stopPlayback();
-        } else if (downX < W / 2 - 35) {
+        } else if (downX < 68) stopSDPlayback();
+        else if (downX < W / 2 - 35) {
           long f = (long)st.frame - (long)(SEEK_STEP_SEC * st.idx.fps);
           seekToFrame(f < 0 ? 0 : (uint32_t)f);
-        } else if (downX < W / 2 + 35) {
-          setPlaying(!st.playing);
-        } else if (downX < W - 68) {
-          seekToFrame(st.frame + (uint32_t)(SEEK_STEP_SEC * st.idx.fps));
-        }
+        } else if (downX < W / 2 + 35) setPlaying(!st.playing);
+        else if (downX < W - 68) seekToFrame(st.frame + (uint32_t)(SEEK_STEP_SEC * st.idx.fps));
         showOsd();
-      } else if (downY > 22) {
-        setPlaying(!st.playing);     // tap video area = play/pause
-      }
+      } else if (downY > 22) setPlaying(!st.playing);
     }
   }
   wasDown = down;
 }
 
-// ---------------------------------------------------------------------------
-// File browser
-// ---------------------------------------------------------------------------
 static void scanVideos() {
   videoList.clear();
+  if (!sdReady) return;
   File dir = SD.open(VIDEO_DIR);
   if (!dir) return;
   File f;
@@ -402,155 +581,1076 @@ static void scanVideos() {
     }
   }
   dir.close();
+  Serial.printf("[SD] scan /videos => %u item(s)\n", (unsigned)videoList.size());
+  for (size_t i = 0; i < videoList.size(); ++i) Serial.printf("[SD] #%u %s\n", (unsigned)i, videoList[i].c_str());
 }
 
 static const int ROWS_PER_PAGE = 6;
 
-static void drawBrowser() {
+static void drawSDBrowser() {
   tft.fillScreen(TFT_BLACK);
-  tft.setTextDatum(TL_DATUM);
-  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
-  tft.drawString("Open CYD Player", 8, 6, 4);
-  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  tft.drawString("/videos on SD card", 8, 32, 2);
-
+  drawHeader("SD TV", true, sdReady ? "SD OK" : "NO SD");
+  if (!sdReady) {
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.drawString("Khong co the SD", 160, 105, 4);
+    tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    tft.drawString("YouTube TV van dung duoc", 160, 140, 2);
+    st.dirty = false;
+    return;
+  }
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextDatum(TL_DATUM);
   int start = st.browserPage * ROWS_PER_PAGE;
   for (int i = 0; i < ROWS_PER_PAGE; i++) {
     int gi = start + i;
     if (gi >= (int)videoList.size()) break;
-    int y = 52 + i * 28;
+    int y = 42 + i * 28;
     tft.fillRoundRect(6, y, tft.width() - 12, 24, 4, tft.color565(24, 24, 24));
     String name = videoList[gi].substring(videoList[gi].lastIndexOf('/') + 1);
-    tft.drawString(name, 14, y + 4, 2);
+    tft.drawString(shorten(name, 34), 14, y + 4, 2);
   }
-
   if (videoList.empty()) {
     tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(TFT_RED, TFT_BLACK);
-    tft.drawString("No .mjpeg files found", tft.width() / 2, 120, 2);
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    tft.drawString("Chua co video", 160, 110, 4);
     tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    tft.drawString("Put movie.mjpeg + movie.mp3 + movie.idx", tft.width() / 2, 145, 2);
-    tft.drawString("in /videos (use tools/convert.py)", tft.width() / 2, 162, 2);
+    tft.drawString("Copy .mjpeg/.mp3/.idx vao /videos", 160, 145, 2);
   }
-
-  // paging arrows
   int pages = (videoList.size() + ROWS_PER_PAGE - 1) / ROWS_PER_PAGE;
   if (pages > 1) {
     tft.setTextDatum(MC_DATUM);
     tft.setTextColor(TFT_CYAN, TFT_BLACK);
-    tft.drawString("<", 20, tft.height() - 12, 4);
-    tft.drawString(">", tft.width() - 20, tft.height() - 12, 4);
-    tft.drawString(String(st.browserPage + 1) + "/" + String(pages), tft.width() / 2, tft.height() - 12, 2);
+    tft.drawString("<", 20, 228, 4);
+    tft.drawString(">", 300, 228, 4);
+    tft.drawString(String(st.browserPage + 1) + "/" + String(pages), 160, 228, 2);
   }
   st.dirty = false;
 }
 
-static void handleBrowserTouch() {
+static void handleSDBrowserTouch() {
   static bool wasDown = false;
-  int x, y;
+  static int lastX = 0, lastY = 0;
+  int x = lastX, y = lastY;
   bool down = readTouch(x, y);
+  if (down) { lastX = x; lastY = y; }
   if (!down && wasDown) {
-    int pages = (videoList.size() + ROWS_PER_PAGE - 1) / ROWS_PER_PAGE;
-    if (y > tft.height() - 26 && pages > 1) {
-      if (x < 60 && st.browserPage > 0) { st.browserPage--; st.dirty = true; }
-      else if (x > tft.width() - 60 && st.browserPage < pages - 1) { st.browserPage++; st.dirty = true; }
-    } else {
-      int row = (y - 52) / 28;
-      int gi = st.browserPage * ROWS_PER_PAGE + row;
-      if (row >= 0 && row < ROWS_PER_PAGE && gi < (int)videoList.size()) {
-        if (!startPlayback(videoList[gi])) st.dirty = true;
+    x = lastX; y = lastY;
+    Serial.printf("[TOUCH][SD_BROWSER] x=%d y=%d page=%d items=%u\n", x, y, st.browserPage, (unsigned)videoList.size());
+    if (y < 34 && x < 60) {
+      st.screen = Screen::HOME; st.dirty = true;
+    } else if (sdReady) {
+      int pages = (videoList.size() + ROWS_PER_PAGE - 1) / ROWS_PER_PAGE;
+      if (y > 214 && pages > 1) {
+        if (x < 60 && st.browserPage > 0) { st.browserPage--; st.dirty = true; }
+        else if (x > 260 && st.browserPage < pages - 1) { st.browserPage++; st.dirty = true; }
+      } else {
+        int row = (y - 42) / 28;
+        int gi = st.browserPage * ROWS_PER_PAGE + row;
+        if (row >= 0 && row < ROWS_PER_PAGE && gi < (int)videoList.size()) {
+          if (!startSDPlayback(videoList[gi])) st.dirty = true;
+        }
       }
     }
   }
   wasDown = down;
 }
 
-// ---------------------------------------------------------------------------
-// setup / loop
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
+// Wi-Fi + server discovery
+// -----------------------------------------------------------------------------
+static void drawStatus(const String &line1, const String &line2 = "") {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.drawString(line1, 160, 103, 4);
+  if (line2.length()) {
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.drawString(line2, 160, 136, 2);
+  }
+}
+
+static void logNetworkState(const char *tag) {
+  Serial.printf("[NET][%s] status=%d ssid='%s' rssi=%d ip=%s mask=%s gw=%s dns=%s\n",
+                tag,
+                (int)WiFi.status(),
+                WiFi.SSID().c_str(),
+                WiFi.RSSI(),
+                WiFi.localIP().toString().c_str(),
+                WiFi.subnetMask().toString().c_str(),
+                WiFi.gatewayIP().toString().c_str(),
+                WiFi.dnsIP().toString().c_str());
+}
+
+static int scanWiFiAndShow(bool showOnScreen) {
+  Serial.println("[WIFI] scan start");
+  int n = WiFi.scanNetworks(false, true);
+  Serial.printf("[WIFI] scan done: %d networks\n", n);
+  for (int i = 0; i < n; ++i) {
+    Serial.printf("[WIFI] #%02d ssid='%s' rssi=%d ch=%d enc=%d\n",
+                  i, WiFi.SSID(i).c_str(), WiFi.RSSI(i), WiFi.channel(i), (int)WiFi.encryptionType(i));
+  }
+  if (showOnScreen) {
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(TFT_CYAN, TFT_BLACK);
+    tft.drawString("CHON WIFI TREN DIEN THOAI", 8, 8, 2);
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.drawString("Ket noi AP: CYD-MiniTV-Setup", 8, 28, 2);
+    tft.drawString("Cac WiFi gan day:", 8, 50, 2);
+    int rows = min(n, 6);
+    for (int i = 0; i < rows; ++i) {
+      uint16_t c = WiFi.RSSI(i) > -67 ? TFT_GREEN : (WiFi.RSSI(i) > -78 ? TFT_YELLOW : TFT_DARKGREY);
+      tft.setTextColor(c, TFT_BLACK);
+      String line = String(i + 1) + ". " + WiFi.SSID(i);
+      if (line.length() > 32) line = line.substring(0, 31) + "~";
+      tft.drawString(line, 12, 74 + i * 22, 2);
+    }
+    if (n <= 0) {
+      tft.setTextColor(TFT_RED, TFT_BLACK);
+      tft.drawString("Khong quet thay SSID", 12, 80, 2);
+    }
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString("Portal se hien danh sach SSID de bam chon", 8, 218, 1);
+  }
+  return n;
+}
+
+static bool ensureWiFi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    logNetworkState("already-connected");
+    WiFi.setSleep(false);
+    return true;
+  }
+
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect(false, false);
+  delay(120);
+  scanWiFiAndShow(true);
+
+  Serial.println("[WIFI] starting WiFiManager portal: CYD-MiniTV-Setup");
+  WiFiManager wm;
+  wm.setDebugOutput(true);
+  wm.setConnectTimeout(15);
+  wm.setConfigPortalTimeout(180);
+  wm.setMinimumSignalQuality(1);
+  wm.setRemoveDuplicateAPs(true);
+  wm.setScanDispPerc(true);
+  const char *menu[] = {"wifi", "info", "exit"};
+  wm.setMenu(menu, 3);
+  bool ok = wm.autoConnect("CYD-MiniTV-Setup");
+  Serial.printf("[WIFI] WiFiManager returned=%d status=%d\n", ok ? 1 : 0, (int)WiFi.status());
+  if (!ok || WiFi.status() != WL_CONNECTED) {
+    ytMessage = "WiFi chua ket noi";
+    logNetworkState("connect-failed");
+    return false;
+  }
+  WiFi.setSleep(false);
+  logNetworkState("connected");
+  return true;
+}
+
+static IPAddress subnetBroadcast() {
+  IPAddress ip = WiFi.localIP();
+  IPAddress mask = WiFi.subnetMask();
+  IPAddress out;
+  for (int i = 0; i < 4; ++i) out[i] = (uint8_t)((ip[i] & mask[i]) | ((~mask[i]) & 0xFF));
+  return out;
+}
+
+static void saveServerCache(IPAddress ip, uint16_t port) {
+  Preferences pref;
+  if (!pref.begin("cydtv", false)) return;
+  pref.putString("server_ip", ip.toString());
+  pref.putUShort("server_port", port);
+  pref.end();
+}
+
+static bool loadServerCache(IPAddress &ip, uint16_t &port) {
+  Preferences pref;
+  if (!pref.begin("cydtv", true)) return false;
+  String host = pref.getString("server_ip", "");
+  port = pref.getUShort("server_port", 8765);
+  pref.end();
+  if (!host.length() || !ip.fromString(host)) return false;
+  Serial.printf("[SERVER] cached NVS %s:%u\n", host.c_str(), port);
+  return true;
+}
+
+static bool validateServer(IPAddress ip, uint16_t port, uint32_t connectTimeoutMs = 80) {
+  WiFiClient c;
+  c.setTimeout(300);
+  uint32_t t0 = millis();
+  if (!c.connect(ip, port, (int32_t)connectTimeoutMs)) return false;
+  Serial.printf("[SERVER] TCP open %s:%u in %lums\n", ip.toString().c_str(), port, (unsigned long)(millis() - t0));
+  c.printf("GET /status HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n", ip.toString().c_str());
+  uint32_t until = millis() + 700;
+  String resp;
+  while ((int32_t)(millis() - until) < 0 && c.connected()) {
+    while (c.available()) {
+      char ch = (char)c.read();
+      if (resp.length() < 900) resp += ch;
+    }
+    if (resp.indexOf("\r\n\r\n") >= 0 && (resp.indexOf("\"running\"") >= 0 || resp.indexOf("\"selected\"") >= 0)) break;
+    delay(2);
+  }
+  c.stop();
+  bool ok = resp.startsWith("HTTP/1.0 200") || resp.startsWith("HTTP/1.1 200");
+  ok = ok && (resp.indexOf("\"running\"") >= 0 || resp.indexOf("\"selected\"") >= 0);
+  Serial.printf("[SERVER] validate %s:%u => %s bytes=%u\n", ip.toString().c_str(), port, ok ? "OK" : "NOT-CYD-TV", (unsigned)resp.length());
+  if (ok) {
+    ytServer = "http://" + ip.toString() + ":" + String(port);
+    saveServerCache(ip, port);
+  }
+  return ok;
+}
+
+static void sendDiscovery(IPAddress dst) {
+  bool begun = discoveryUdp.beginPacket(dst, DISCOVERY_SERVER_PORT);
+  if (!begun) {
+    Serial.printf("[DISCOVERY] beginPacket failed dst=%s\n", dst.toString().c_str());
+    return;
+  }
+  discoveryUdp.write((const uint8_t *)"CYD_TV_DISCOVER", 15);
+  bool ok = discoveryUdp.endPacket();
+  Serial.printf("[DISCOVERY] TX dst=%s:%u result=%d\n", dst.toString().c_str(), DISCOVERY_SERVER_PORT, ok ? 1 : 0);
+}
+
+static bool waitDiscoveryReply(uint32_t waitMs) {
+  uint32_t until = millis() + waitMs;
+  while ((int32_t)(millis() - until) < 0) {
+    int n = discoveryUdp.parsePacket();
+    if (n > 0) {
+      IPAddress remote = discoveryUdp.remoteIP();
+      uint16_t remotePort = discoveryUdp.remotePort();
+      String reply;
+      while (discoveryUdp.available()) reply += (char)discoveryUdp.read();
+      Serial.printf("[DISCOVERY] RX from %s:%u n=%d payload='%s'\n",
+                    remote.toString().c_str(), remotePort, n, reply.c_str());
+      if (reply.startsWith("CYD_TV_SERVER|")) {
+        int port = reply.substring(14).toInt();
+        if (port <= 0) port = 8765;
+        if (validateServer(remote, (uint16_t)port, 150)) return true;
+      }
+    }
+    delay(5);
+  }
+  return false;
+}
+
+static bool scanSubnetForServer() {
+  IPAddress local = WiFi.localIP();
+  IPAddress mask = WiFi.subnetMask();
+  if (!(mask[0] == 255 && mask[1] == 255 && mask[2] == 255)) {
+    Serial.printf("[SERVER] fallback /24 scan despite mask=%s\n", mask.toString().c_str());
+  }
+  drawStatus("QUET LAN", "UDP khong thay - dang quet TCP...");
+  Serial.printf("[SERVER] TCP fallback scan subnet %u.%u.%u.0/24 port 8765\n", local[0], local[1], local[2]);
+
+  IPAddress gw = WiFi.gatewayIP();
+  if (gw != local && validateServer(gw, 8765, 50)) return true;
+
+  // Scan the same /24. A short timeout keeps worst case to a few seconds.
+  for (int host = 1; host <= 254; ++host) {
+    if (host == local[3] || host == gw[3]) continue;
+    IPAddress ip(local[0], local[1], local[2], host);
+    if ((host & 15) == 0) {
+      Serial.printf("[SERVER] scan progress ...%d\n", host);
+      tft.fillRect(20, 160, 280, 20, TFT_BLACK);
+      tft.setTextDatum(MC_DATUM);
+      tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+      tft.drawString(String("IP ") + ip.toString(), 160, 170, 2);
+    }
+    if (validateServer(ip, 8765, 28)) return true;
+    delay(1);
+  }
+  return false;
+}
+
+static bool discoverYTServer() {
+  if (ytServer.length()) {
+    Serial.printf("[SERVER] cached server=%s\n", ytServer.c_str());
+    return true;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[SERVER] discovery aborted: WiFi not connected");
+    return false;
+  }
+
+  logNetworkState("discovery-start");
+  drawStatus("TIM SERVER", "UDP broadcast + TCP fallback");
+  discoveryUdp.stop();
+  if (!discoveryUdp.begin(DISCOVERY_LOCAL_PORT)) {
+    Serial.printf("[DISCOVERY] UDP begin failed local port=%u\n", DISCOVERY_LOCAL_PORT);
+  } else {
+    IPAddress directed = subnetBroadcast();
+    Serial.printf("[DISCOVERY] localPort=%u directedBroadcast=%s\n", DISCOVERY_LOCAL_PORT, directed.toString().c_str());
+    for (int attempt = 1; attempt <= 3; ++attempt) {
+      Serial.printf("[DISCOVERY] attempt=%d\n", attempt);
+      sendDiscovery(directed);
+      if (directed != IPAddress(255,255,255,255)) sendDiscovery(IPAddress(255,255,255,255));
+      if (waitDiscoveryReply(900)) {
+        discoveryUdp.stop();
+        Serial.printf("[SERVER] found by UDP: %s\n", ytServer.c_str());
+        return true;
+      }
+    }
+    discoveryUdp.stop();
+  }
+
+  Serial.println("[SERVER] UDP discovery failed, trying last-known NVS cache");
+  IPAddress cachedIp;
+  uint16_t cachedPort = 8765;
+  if (loadServerCache(cachedIp, cachedPort) && validateServer(cachedIp, cachedPort, 120)) {
+    Serial.printf("[SERVER] found by NVS cache: %s\n", ytServer.c_str());
+    return true;
+  }
+
+  Serial.println("[SERVER] cache failed, trying TCP subnet scan");
+  if (scanSubnetForServer()) {
+    Serial.printf("[SERVER] found by TCP scan: %s\n", ytServer.c_str());
+    return true;
+  }
+
+  ytMessage = "Khong tim thay server";
+  Serial.println("[SERVER] FAIL: no CYD TV server found on UDP or TCP scan");
+  return false;
+}
+
+static bool ensureYTReady() {
+  if (!ensureWiFi()) return false;
+  if (!discoverYTServer()) return false;
+  return true;
+}
+
+static bool fetchYTList(const String &query, bool searchMode);
+
+static void rawSDProbe() {
+  Serial.printf("[SDPROBE] pins CS=%d SCK=%d MISO=%d MOSI=%d idleMISO=%d\n",
+                SD_CS, SD_SCK, SD_MISO, SD_MOSI, digitalRead(SD_MISO));
+  SD.end();
+  delay(30);
+  sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  pinMode(SD_CS, OUTPUT);
+  digitalWrite(SD_CS, HIGH);
+  sdSPI.beginTransaction(SPISettings(250000, MSBFIRST, SPI_MODE0));
+  for (int i = 0; i < 12; ++i) sdSPI.transfer(0xFF); // >= 80 clocks with CS high
+  digitalWrite(SD_CS, LOW);
+  sdSPI.transfer(0xFF);
+  const uint8_t cmd0[6] = {0x40, 0x00, 0x00, 0x00, 0x00, 0x95};
+  for (uint8_t b : cmd0) sdSPI.transfer(b);
+  Serial.print("[SDPROBE] CMD0 response bytes:");
+  uint8_t first = 0xFF;
+  for (int i = 0; i < 24; ++i) {
+    uint8_t r = sdSPI.transfer(0xFF);
+    if (first == 0xFF && r != 0xFF) first = r;
+    Serial.printf(" %02X", r);
+  }
+  Serial.println();
+  digitalWrite(SD_CS, HIGH);
+  sdSPI.transfer(0xFF);
+  sdSPI.endTransaction();
+  Serial.printf("[SDPROBE] firstNonFF=0x%02X (%s) finalMISO=%d\n",
+                first, first == 0x01 ? "CARD ENTERED IDLE" : "NO VALID CMD0 RESPONSE", digitalRead(SD_MISO));
+}
+
+static void logTFTDiagnostics() {
+  setup_t si;
+  tft.getSetup(si);
+  Serial.printf("[TFT] lib=%s driver=0x%04X port=%u size=%ux%u pins MOSI=%d MISO=%d SCLK=%d CS=%d DC=%d RST=%d BL=%d spi=%d rd=%d\n",
+                si.version.c_str(), si.tft_driver, (unsigned)si.port, si.tft_width, si.tft_height,
+                si.pin_tft_mosi, si.pin_tft_miso, si.pin_tft_clk, si.pin_tft_cs,
+                si.pin_tft_dc, si.pin_tft_rst, si.pin_tft_led, si.tft_spi_freq, si.tft_rd_freq);
+  uint8_t r0a = tft.readcommand8(0x0A, 0);
+  uint8_t r0b = tft.readcommand8(0x0B, 0);
+  uint8_t r0c = tft.readcommand8(0x0C, 0);
+  uint8_t d30 = tft.readcommand8(0xD3, 0);
+  uint8_t d31 = tft.readcommand8(0xD3, 1);
+  uint8_t d32 = tft.readcommand8(0xD3, 2);
+  uint8_t d33 = tft.readcommand8(0xD3, 3);
+  Serial.printf("[TFT] regs 0A=%02X 0B=%02X 0C=%02X D3=%02X %02X %02X %02X\n", r0a, r0b, r0c, d30, d31, d32, d33);
+}
+
+static void runTFTColorTest() {
+  struct P { uint16_t c; const char *name; uint16_t text; };
+  const P p[] = {
+    {TFT_RED, "RED", TFT_WHITE}, {TFT_GREEN, "GREEN", TFT_BLACK},
+    {TFT_BLUE, "BLUE", TFT_WHITE}, {TFT_WHITE, "WHITE", TFT_BLACK},
+    {TFT_BLACK, "BLACK", TFT_WHITE}
+  };
+  Serial.println("[TFTTEST] begin RED/GREEN/BLUE/WHITE/BLACK");
+  for (const auto &v : p) {
+    tft.fillScreen(v.c);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(v.text, v.c);
+    tft.drawString(v.name, tft.width()/2, tft.height()/2, 4);
+    delay(700);
+    uint16_t px = tft.readPixel(8, 8);
+    Serial.printf("[TFTTEST] %s expected=0x%04X readPixel=0x%04X\n", v.name, v.c, px);
+  }
+  st.dirty = true;
+  Serial.println("[TFTTEST] end");
+}
+
+static void handleSerialDebug() {
+  static String cmd;
+  while (Serial.available()) {
+    char c = (char)Serial.read();
+    if (c == '\r') continue;
+    if (c != '\n') {
+      if (cmd.length() < 64) cmd += c;
+      continue;
+    }
+    cmd.trim();
+    if (!cmd.length()) continue;
+    Serial.printf("[UART] cmd='%s'\n", cmd.c_str());
+    if (cmd == "net") {
+      logNetworkState("uart");
+      Serial.printf("[UART] ytServer='%s'\n", ytServer.c_str());
+    } else if (cmd == "scan") {
+      scanWiFiAndShow(false);
+    } else if (cmd == "discover") {
+      ytServer = "";
+      bool ok = discoverYTServer();
+      Serial.printf("[UART] discover result=%d server='%s'\n", ok ? 1 : 0, ytServer.c_str());
+      st.dirty = true;
+    } else if (cmd == "ready") {
+      ytServer = "";
+      bool ok = ensureYTReady();
+      Serial.printf("[UART] ready result=%d server='%s'\n", ok ? 1 : 0, ytServer.c_str());
+      if (ok) {
+        bool feedOk = fetchYTList(ytQuery, false);
+        Serial.printf("[UART] feed result=%d items=%u\n", feedOk ? 1 : 0, (unsigned)ytItems.size());
+      }
+      st.dirty = true;
+    } else if (cmd == "sdprobe") {
+      rawSDProbe();
+    } else if (cmd == "sd") {
+      Serial.println("[UART] SD re-init test");
+      SD.end();
+      delay(50);
+      sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+      sdReady = SD.begin(SD_CS, sdSPI, 1000000);
+      Serial.printf("[SD] ready=%d type=%u size=%.1fMB used=%.1fMB\n",
+                    sdReady ? 1 : 0,
+                    sdReady ? (unsigned)SD.cardType() : 0,
+                    sdReady ? SD.cardSize()/1048576.0 : 0.0,
+                    sdReady ? SD.usedBytes()/1048576.0 : 0.0);
+      if (sdReady) scanVideos();
+      st.dirty = true;
+    } else if (cmd == "tftinfo") {
+      logTFTDiagnostics();
+    } else if (cmd == "tfttest") {
+      runTFTColorTest();
+    } else if (cmd == "touch") {
+      touchDebugUntil = millis() + 10000;
+      Serial.println("[TOUCH] raw + mapped logging enabled for 10 seconds");
+    } else if (cmd == "heap") {
+      Serial.printf("[HEAP] free=%u largest=%u min=%u\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap(), ESP.getMinFreeHeap());
+    } else if (cmd == "fps") {
+      uint32_t ms = ytStatsStartMs ? millis() - ytStatsStartMs : 0;
+      float fps = ms ? (ytFramesDecoded * 1000.0f / ms) : 0.0f;
+      float avgKb = ytFramesRx ? (ytJpegBytes / 1024.0f / ytFramesRx) : 0.0f;
+      float decMs = ytFramesDecoded ? (ytDecodeUs / 1000.0f / ytFramesDecoded) : 0.0f;
+      float renMs = ytFramesDecoded ? (ytRenderUs / 1000.0f / ytFramesDecoded) : 0.0f;
+      Serial.printf("[FPS] elapsed=%lums rx=%lu decoded=%lu dropped=%lu fps=%.2f avgJPEG=%.2fKB decode=%.2fms render=%.2fms\n",
+                    (unsigned long)ms, (unsigned long)ytFramesRx, (unsigned long)ytFramesDecoded,
+                    (unsigned long)ytFramesDropped, fps, avgKb, decMs, renMs);
+    } else if (cmd == "rbswap on") {
+      jpegSwapRB = true;
+      Serial.println("[COLOR] software RB swap=ON");
+    } else if (cmd == "rbswap off") {
+      jpegSwapRB = false;
+      Serial.println("[COLOR] software RB swap=OFF");
+    } else if (cmd == "colorauto") {
+      runJPEGColorAutoTest();
+      st.dirty = true;
+    } else if (cmd.startsWith("color ") && cmd.length() >= 7) {
+      applyJPEGColorMode(cmd[6]);
+      st.dirty = true;
+    } else if (cmd == "playtest") {
+      if (!sdReady) Serial.println("[PLAYTEST] SD not ready");
+      else if (!startSDPlayback(String(VIDEO_DIR) + "/COLOR_TEST")) Serial.println("[PLAYTEST] COLOR_TEST failed");
+    } else if (cmd == "playreal") {
+      if (!sdReady) Serial.println("[PLAYTEST] SD not ready");
+      else if (!startSDPlayback(String(VIDEO_DIR) + "/REAL_TEST")) Serial.println("[PLAYTEST] REAL_TEST failed");
+    } else if (cmd == "clearwifi") {
+      Serial.println("[UART] clearing WiFi credentials and restarting");
+      WiFiManager wm;
+      wm.resetSettings();
+      delay(200);
+      ESP.restart();
+    } else if (cmd == "help") {
+      Serial.println("[UART] commands: help | net | scan | sdprobe | sd | ready | discover | tftinfo | tfttest | touch | heap | fps | rbswap on/off | colorauto | color A/B/C/D | playtest | playreal | clearwifi");
+    } else {
+      Serial.println("[UART] unknown command; type help");
+    }
+    cmd = "";
+  }
+}
+
+static String urlEncode(const String &s) {
+  String out;
+  char hex[] = "0123456789ABCDEF";
+  for (size_t i = 0; i < s.length(); ++i) {
+    uint8_t c = (uint8_t)s[i];
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.') out += (char)c;
+    else if (c == ' ') out += "%20";
+    else { out += '%'; out += hex[c >> 4]; out += hex[c & 0xF]; }
+  }
+  return out;
+}
+
+// -----------------------------------------------------------------------------
+// YouTube feed/search/browser
+// -----------------------------------------------------------------------------
+static bool fetchYTList(const String &query, bool searchMode) {
+  if (!ensureYTReady()) return false;
+  ytFeedLoading = true;
+  drawStatus(searchMode ? "SEARCH" : "YOUTUBE", "Dang tai danh sach...");
+  HTTPClient http;
+  String url = ytServer + (searchMode ? "/api/search?q=" : "/api/feed?q=") + urlEncode(query);
+  http.setTimeout(20000);
+  if (!http.begin(url)) { ytFeedLoading = false; return false; }
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    ytMessage = "Server HTTP " + String(code);
+    http.end(); ytFeedLoading = false; return false;
+  }
+  String payload = http.getString();
+  http.end();
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err || !doc["ok"].as<bool>()) {
+    ytMessage = err ? "JSON loi" : String((const char *)(doc["error"] | "Search loi"));
+    ytFeedLoading = false; return false;
+  }
+  ytItems.clear();
+  for (JsonObject obj : doc["items"].as<JsonArray>()) {
+    YTItem v;
+    v.id = String((const char *)(obj["id"] | ""));
+    v.url = String((const char *)(obj["url"] | ""));
+    v.title = String((const char *)(obj["title"] | "Untitled"));
+    v.channel = String((const char *)(obj["channel"] | "YouTube"));
+    v.duration = obj["duration"] | 0;
+    if (v.url.length()) ytItems.push_back(v);
+    if (ytItems.size() >= 15) break;
+  }
+  ytScroll = 0;
+  ytMessage = ytItems.empty() ? "Khong co ket qua" : "";
+  ytFeedLoading = false;
+  st.dirty = true;
+  return !ytItems.empty();
+}
+
+static bool drawYTThumbnail(const YTItem &v, int x, int y) {
+  if (!ytServer.length() || !v.id.length()) return false;
+  HTTPClient http;
+  http.setTimeout(3500);
+  if (!http.begin(ytServer + "/thumb/" + v.id + ".jpg")) return false;
+  int code = http.GET();
+  int len = http.getSize();
+  if (code != HTTP_CODE_OK || len <= 0 || len > 40 * 1024 || !ensureBuf((size_t)len)) { http.end(); return false; }
+  WiFiClient *s = http.getStreamPtr();
+  int got = s->readBytes(frameBuf, len);
+  http.end();
+  if (got != len) return false;
+  if (!jpeg.openRAM(frameBuf, len, jpegDraw)) return false;
+  prepareJPEGDecode();
+  jpeg.decode(x, y, 0);
+  jpeg.close();
+  return true;
+}
+
+static void drawYTBrowser() {
+  tft.fillScreen(TFT_BLACK);
+  String wifi = WiFi.status() == WL_CONNECTED ? "S" : "WIFI";
+  drawHeader("YouTube TV", true, "SEARCH");
+  if (!ytServer.length()) {
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    tft.drawString("Chua co server", 160, 96, 4);
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.drawString(ytMessage.length() ? ytMessage : "Cham de ket noi", 160, 128, 2);
+    tft.drawRoundRect(80, 160, 160, 42, 8, TFT_CYAN);
+    tft.drawString("KET NOI", 160, 181, 2);
+    st.dirty = false;
+    return;
+  }
+  if (ytItems.empty()) {
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+    tft.drawString(ytMessage.length() ? ytMessage : "Dang tai...", 160, 110, 4);
+    tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    tft.drawString("Server: " + ytServer.substring(7), 160, 145, 2);
+    st.dirty = false;
+    return;
+  }
+  for (int row = 0; row < YT_ROWS; ++row) {
+    int idx = ytScroll + row;
+    if (idx >= (int)ytItems.size()) break;
+    int y = 36 + row * YT_ROW_H;
+    const YTItem &v = ytItems[idx];
+    tft.fillRect(0, y, 320, YT_ROW_H - 2, tft.color565(9, 10, 13));
+    tft.fillRect(4, y + 4, 96, 54, tft.color565(30, 30, 34));
+    if (!drawYTThumbnail(v, 4, y + 4)) {
+      tft.setTextDatum(MC_DATUM);
+      tft.setTextColor(TFT_DARKGREY, tft.color565(30, 30, 34));
+      tft.drawString("YT", 52, y + 31, 4);
+    }
+    tft.setTextDatum(TL_DATUM);
+    tft.setTextColor(TFT_WHITE, tft.color565(9, 10, 13));
+    tft.drawString(shorten(v.title, 27), 106, y + 5, 2);
+    String line2 = v.title.length() > 27 ? shorten(v.title.substring(24), 27) : "";
+    if (line2.length()) tft.drawString(line2, 106, y + 23, 2);
+    tft.setTextColor(TFT_DARKGREY, tft.color565(9, 10, 13));
+    String meta = shorten(v.channel, 18);
+    if (v.duration) meta += "  " + fmtTime(v.duration);
+    tft.drawString(meta, 106, y + 44, 1);
+  }
+  tft.setTextDatum(BR_DATUM);
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.drawString(String(ytScroll + 1) + "-" + String(min(ytScroll + YT_ROWS, (int)ytItems.size())) + "/" + String(ytItems.size()), 316, 238, 1);
+  st.dirty = false;
+}
+
+static void enterYouTube() {
+  st.screen = Screen::YT_BROWSER;
+  st.dirty = true;
+  if (!ensureYTReady()) return;
+  if (ytItems.empty()) fetchYTList(ytQuery, false);
+}
+
+static void handleYTBrowserTouch() {
+  static bool wasDown = false;
+  static int downX = 0, downY = 0, lastX = 0, lastY = 0;
+  int x, y;
+  bool down = readTouch(x, y);
+  if (down && !wasDown) { downX = lastX = x; downY = lastY = y; }
+  if (down) { lastX = x; lastY = y; }
+  if (!down && wasDown) {
+    int dy = lastY - downY;
+    int dx = lastX - downX;
+    if (abs(dy) > 24 && abs(dy) > abs(dx)) {
+      int step = abs(dy) > 90 ? 2 : 1;
+      if (dy < 0) ytScroll = min(ytScroll + step, max(0, (int)ytItems.size() - YT_ROWS));
+      else ytScroll = max(0, ytScroll - step);
+      st.dirty = true;
+    } else if (downY < 34) {
+      if (downX < 62) { st.screen = Screen::HOME; st.dirty = true; }
+      else if (downX > 235) { st.screen = Screen::YT_KEYBOARD; st.dirty = true; }
+    } else if (!ytServer.length()) {
+      if (downY > 145) { ytServer = ""; if (ensureYTReady()) fetchYTList(ytQuery, false); st.dirty = true; }
+    } else {
+      int row = (downY - 36) / YT_ROW_H;
+      int idx = ytScroll + row;
+      if (row >= 0 && row < YT_ROWS && idx < (int)ytItems.size()) {
+        // start stream in a separate function below
+        ytPlayingTitle = ytItems[idx].title;
+        // store selected URL temporarily in query-like global via direct start call
+        YTItem chosen = ytItems[idx];
+        // close existing stream before opening new one
+        if (ytStreamActive) { ytStreamHttp.end(); ytStreamActive = false; }
+        drawStatus("DANG MO VIDEO", shorten(chosen.title, 28));
+        HTTPClient cmd;
+        if (cmd.begin(ytServer + "/api/play")) {
+          cmd.addHeader("Content-Type", "application/json");
+          JsonDocument req;
+          req["url"] = chosen.url;
+          req["title"] = chosen.title;
+          String body; serializeJson(req, body);
+          int rc = cmd.POST(body);
+          cmd.end();
+          if (rc >= 200 && rc < 300) {
+            ytStreamHttp.setTimeout(10000);
+            if (ytStreamHttp.begin(ytServer + "/stream.mjpg")) {
+              int sc = ytStreamHttp.GET();
+              if (sc == HTTP_CODE_OK) {
+                ytStreamClient = ytStreamHttp.getStreamPtr();
+                ytStreamActive = true;
+                ytParserInJpeg = false;
+                ytParserPrev = -1;
+                ytParserN = 0;
+                ytParserLastByteMs = millis();
+                ytStatsStartMs = millis();
+                ytFramesRx = ytFramesDecoded = ytFramesDropped = 0;
+                ytJpegBytes = ytDecodeUs = ytRenderUs = 0;
+                st.screen = Screen::YT_PLAYER;
+                st.osdVisible = true;
+                st.osdShownMs = millis();
+                tft.fillScreen(TFT_BLACK);
+              } else { ytStreamHttp.end(); ytMessage = "Stream HTTP " + String(sc); st.dirty = true; }
+            }
+          } else { ytMessage = "Play HTTP " + String(rc); st.dirty = true; }
+        }
+      }
+    }
+  }
+  wasDown = down;
+}
+
+// -----------------------------------------------------------------------------
+// Search keyboard
+// -----------------------------------------------------------------------------
+static const char *KB[32] = {
+  "A","B","C","D","E","F","G","H",
+  "I","J","K","L","M","N","O","P",
+  "Q","R","S","T","U","V","W","X",
+  "Y","Z","<-","SP","GO","CLR","BACK","."
+};
+
+static void drawYTKeyboard() {
+  tft.fillScreen(TFT_BLACK);
+  drawHeader("Search YouTube", true);
+  tft.fillRoundRect(6, 38, 308, 34, 5, tft.color565(24, 27, 32));
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(TFT_WHITE, tft.color565(24, 27, 32));
+  tft.drawString(shorten(ytQuery, 36), 12, 55, 2);
+  const int keyY = 76;
+  const int keyH = 40;
+  for (int i = 0; i < 32; ++i) {
+    int col = i % 8, row = i / 8;
+    int x = col * 40, y = keyY + row * keyH;
+    uint16_t bg = (i == 28) ? tft.color565(170, 0, 0) : tft.color565(28, 31, 37);
+    tft.fillRoundRect(x + 2, y + 2, 36, 36, 4, bg);
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(TFT_WHITE, bg);
+    tft.drawString(KB[i], x + 20, y + 20, i >= 26 ? 1 : 2);
+  }
+  st.dirty = false;
+}
+
+static void handleYTKeyboardTouch() {
+  static bool wasDown = false;
+  static int lastX = 0, lastY = 0;
+  int x = lastX, y = lastY;
+  bool down = readTouch(x, y);
+  if (down) { lastX = x; lastY = y; }
+  if (!down && wasDown) {
+    x = lastX; y = lastY;
+    if (y < 34 && x < 60) { st.screen = Screen::YT_BROWSER; st.dirty = true; }
+    else if (y >= 76) {
+      int col = constrain(x / 40, 0, 7);
+      int row = constrain((y - 76) / 40, 0, 3);
+      int i = row * 8 + col;
+      if (i >= 0 && i < 26) { if (ytQuery.length() < 48) ytQuery += KB[i]; }
+      else if (i == 26) { if (ytQuery.length()) ytQuery.remove(ytQuery.length() - 1); }
+      else if (i == 27) { if (ytQuery.length() < 48) ytQuery += ' '; }
+      else if (i == 28) {
+        if (ytQuery.length()) { st.screen = Screen::YT_BROWSER; fetchYTList(ytQuery, true); st.dirty = true; }
+      } else if (i == 29) ytQuery = "";
+      else if (i == 30) { st.screen = Screen::YT_BROWSER; st.dirty = true; }
+      else if (i == 31) { if (ytQuery.length() < 48) ytQuery += '.'; }
+      st.dirty = true;
+    }
+  }
+  wasDown = down;
+}
+
+// -----------------------------------------------------------------------------
+// YouTube MJPEG stream
+// -----------------------------------------------------------------------------
+static int readNextYTFrame() {
+  if (!ytStreamActive || !ytStreamClient) return -1;
+  if (!ensureBuf(64 * 1024)) return -1;
+
+  // If a partial JPEG has stalled for too long, discard only that partial frame and
+  // resynchronise at the next SOI. This prevents a single dropped packet freezing TV.
+  if (ytParserInJpeg && ytParserLastByteMs && millis() - ytParserLastByteMs > 2000) {
+    Serial.printf("[YT] stale partial frame dropped (%u bytes)\n", (unsigned)ytParserN);
+    ytFramesDropped++;
+    ytParserInJpeg = false;
+    ytParserPrev = -1;
+    ytParserN = 0;
+  }
+
+  uint32_t sliceStart = micros();
+  size_t processed = 0;
+  const size_t BYTE_BUDGET = 24576;
+  const uint32_t TIME_BUDGET_US = 12000;
+
+  while (processed < BYTE_BUDGET && (micros() - sliceStart) < TIME_BUDGET_US) {
+    int avail = ytStreamClient->available();
+    if (avail <= 0) {
+      if (!ytStreamClient->connected()) return 0;
+      break;
+    }
+    while (avail-- > 0 && processed < BYTE_BUDGET && (micros() - sliceStart) < TIME_BUDGET_US) {
+      int b = ytStreamClient->read();
+      if (b < 0) break;
+      ++processed;
+      ytParserLastByteMs = millis();
+
+      if (!ytParserInJpeg) {
+        if (ytParserPrev == 0xFF && b == 0xD8) {
+          ytParserInJpeg = true;
+          ytParserN = 0;
+          frameBuf[ytParserN++] = 0xFF;
+          frameBuf[ytParserN++] = 0xD8;
+        }
+      } else {
+        if (ytParserN >= frameBufSize && !ensureBuf(frameBufSize + 32 * 1024)) {
+          ytParserInJpeg = false; ytParserN = 0; ytParserPrev = -1;
+          return -1;
+        }
+        frameBuf[ytParserN++] = (uint8_t)b;
+        if (ytParserPrev == 0xFF && b == 0xD9) {
+          int len = (int)ytParserN;
+          ytFramesRx++;
+          ytJpegBytes += (uint32_t)len;
+          ytParserInJpeg = false;
+          ytParserN = 0;
+          ytParserPrev = -1;
+          return len;
+        }
+      }
+      ytParserPrev = b;
+    }
+  }
+  // No complete frame yet. Parser state is intentionally retained for next loop.
+  return -1;
+}
+
+static void stopYTStream() {
+  if (ytStreamActive) ytStreamHttp.end();
+  ytStreamActive = false;
+  ytStreamClient = nullptr;
+  ytParserInJpeg = false;
+  ytParserPrev = -1;
+  ytParserN = 0;
+  ytParserLastByteMs = 0;
+  st.screen = Screen::YT_BROWSER;
+  st.dirty = true;
+}
+
+static void drawYTOSD() {
+  tft.fillRect(0, 0, 320, 28, TFT_BLACK);
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("< BACK", 6, 14, 2);
+  tft.setTextDatum(MR_DATUM);
+  tft.drawString(shorten(ytPlayingTitle, 27), 314, 14, 2);
+  tft.fillRect(0, 216, 320, 24, TFT_BLACK);
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.drawString("YouTube via LAN  |  VIDEO ONLY", 160, 228, 2);
+}
+
+static void handleYTPlayerTouch() {
+  static bool wasDown = false;
+  static int downX = 0, downY = 0, lastX = 0, lastY = 0;
+  static uint32_t downMs = 0;
+  int x, y;
+  bool down = readTouch(x, y);
+  if (down && !wasDown) {
+    downX = lastX = x;
+    downY = lastY = y;
+    downMs = millis();
+  }
+  if (down) {
+    lastX = x;
+    lastY = y;
+    // Hold top-left for 700 ms = forced back, independent of OSD state.
+    if (downX < 100 && downY < 70 && millis() - downMs > 700) {
+      Serial.println("[TOUCH] YT forced BACK (hold top-left)");
+      stopYTStream();
+      wasDown = false;
+      return;
+    }
+  }
+  if (!down && wasDown) {
+    int dx = lastX - downX;
+    int dy = lastY - downY;
+    // Swipe from left edge to right = back.
+    if (downX < 55 && dx > 70 && abs(dx) > abs(dy)) {
+      Serial.printf("[TOUCH] YT BACK swipe dx=%d dy=%d\n", dx, dy);
+      stopYTStream();
+    } else if (downX < 110 && downY < 60) {
+      // Top-left always backs out; OSD no longer needs to be visible first.
+      Serial.printf("[TOUCH] YT BACK tap x=%d y=%d\n", downX, downY);
+      stopYTStream();
+    } else {
+      st.osdVisible = !st.osdVisible;
+      st.osdShownMs = millis();
+      Serial.printf("[TOUCH] YT OSD=%d x=%d y=%d\n", st.osdVisible ? 1 : 0, downX, downY);
+    }
+  }
+  wasDown = down;
+}
+
+// -----------------------------------------------------------------------------
+// Home
+// -----------------------------------------------------------------------------
+static void drawHome() {
+  tft.fillScreen(tft.color565(5, 7, 11));
+  tft.setTextDatum(MC_DATUM);
+  tft.setTextColor(TFT_WHITE, tft.color565(5, 7, 11));
+  tft.drawString("CYD MINI TV", 160, 30, 4);
+  tft.setTextColor(TFT_DARKGREY, tft.color565(5, 7, 11));
+  tft.drawString("ESP32-2432S028R", 160, 54, 2);
+  tft.fillRoundRect(18, 78, 284, 60, 10, tft.color565(22, 26, 34));
+  tft.fillRoundRect(18, 150, 284, 60, 10, tft.color565(134, 0, 0));
+  tft.setTextColor(TFT_CYAN, tft.color565(22, 26, 34));
+  tft.drawString("SD VIDEO", 160, 102, 4);
+  tft.setTextColor(TFT_LIGHTGREY, tft.color565(22, 26, 34));
+  tft.drawString(sdReady ? "MJPEG + MP3" : "No SD - van vao duoc", 160, 125, 1);
+  tft.setTextColor(TFT_WHITE, tft.color565(134, 0, 0));
+  tft.drawString("YOUTUBE TV", 160, 174, 4);
+  tft.drawString("Swipe feed / Search / Tap to play", 160, 198, 1);
+  tft.setTextColor(WiFi.status() == WL_CONNECTED ? TFT_GREEN : TFT_DARKGREY, tft.color565(5, 7, 11));
+  tft.drawString(WiFi.status() == WL_CONNECTED ? ("WiFi " + WiFi.localIP().toString()) : "WiFi setup khi vao YouTube", 160, 228, 1);
+  st.dirty = false;
+}
+
+static void handleHomeTouch() {
+  static bool wasDown = false;
+  static int lastX = 0, lastY = 0;
+  int x = lastX, y = lastY;
+  bool down = readTouch(x, y);
+  if (down) { lastX = x; lastY = y; }
+  if (!down && wasDown) {
+    x = lastX; y = lastY;
+    Serial.printf("[TOUCH][HOME] x=%d y=%d\n", x, y);
+    if (y >= 70 && y < 145) { st.screen = Screen::SD_BROWSER; st.dirty = true; }
+    else if (y >= 145 && y < 220) enterYouTube();
+  }
+  wasDown = down;
+}
+
 void setup() {
   Serial.begin(115200);
-
-  // Backlight PWM
   ledcSetup(BL_CHANNEL, BL_FREQ, BL_RES_BITS);
   ledcAttachPin(BL_PIN, BL_CHANNEL);
   setBrightness(DEFAULT_BRIGHT);
 
-  // Display
   tft.init();
-  tft.setRotation(1);                // landscape 320x240
-  tft.setSwapBytes(true);
+  tft.setRotation(1);
+  delay(20);
+  // Match the known-good CYD Slideshow JPEG path exactly:
+  // JPEGDEC default RGB565 little-endian + TFT_eSPI byte swap.
+  applyJPEGColorMode('D');
   tft.fillScreen(TFT_BLACK);
+  logTFTDiagnostics();
 
-  // Touch (dedicated SPI bus)
-  touchSPI.begin(TOUCH_CLK, TOUCH_DO, TOUCH_DIN, TOUCH_CS);
-  touch.begin(touchSPI);
-  touch.setRotation(1);
+  // XPT2046 touch uses software SPI. The CYD routes TFT, touch and SD to
+  // three different pin groups but the classic ESP32 only has two user SPI hosts.
+  pinMode(TOUCH_CLK, OUTPUT);
+  pinMode(TOUCH_DIN, OUTPUT);
+  pinMode(TOUCH_DO, INPUT);
+  pinMode(TOUCH_CS, OUTPUT);
+  pinMode(TOUCH_IRQ, INPUT);
+  digitalWrite(TOUCH_CS, HIGH);
+  digitalWrite(TOUCH_CLK, LOW);
 
-  // SD card
-  if (!SD.begin(SD_CS)) {
-    tft.setTextDatum(MC_DATUM);
-    tft.setTextColor(TFT_RED, TFT_BLACK);
-    tft.drawString("SD card not found!", tft.width() / 2, tft.height() / 2, 4);
-    while (!SD.begin(SD_CS)) delay(500);
-    tft.fillScreen(TFT_BLACK);
+  // SD owns VSPI exclusively: SCK=18, MISO=19, MOSI=23, CS=5.
+  // TFT_eSPI is compiled with USE_HSPI_PORT=1, so it cannot remap this bus.
+  pinMode(SD_CS, OUTPUT);
+  digitalWrite(SD_CS, HIGH);
+  sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  sdReady = SD.begin(SD_CS, sdSPI, 4000000);
+  if (!sdReady) {
+    Serial.println("[SD] init @4MHz failed, retry @1MHz");
+    SD.end();
+    delay(50);
+    sdReady = SD.begin(SD_CS, sdSPI, 1000000);
   }
 
-  // Audio out
-#if USE_EXTERNAL_I2S_DAC
-  audio.setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT);
-#else
-  audio.setInternalDAC(true);        // GPIO26 -> onboard amp
-#endif
-  audio.setVolume(DEFAULT_VOLUME);
-
-  audioMutex = xSemaphoreCreateMutex();
-  xTaskCreatePinnedToCore(audioTask, "audio", 8192, nullptr, 2, &audioTaskHandle, 0);
-
-  scanVideos();
+  if (sdReady) scanVideos();
+  WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.setSleep(false);
+  Serial.println("[WIFI] boot: trying saved credentials in background");
+  WiFi.begin();
+  st.screen = Screen::HOME;
   st.dirty = true;
+  if (sdReady) {
+    Serial.printf("CYD Mini TV boot: SD=OK type=%u total=%.1fMB used=%.1fMB heap=%u\n", (unsigned)SD.cardType(), SD.totalBytes()/1048576.0, SD.usedBytes()/1048576.0, ESP.getFreeHeap());
+  } else {
+    Serial.printf("CYD Mini TV boot: SD=NONE heap=%u\n", ESP.getFreeHeap());
+  }
 }
 
 void loop() {
-  if (st.screen == Screen::BROWSER) {
-    if (st.dirty) drawBrowser();
-    handleBrowserTouch();
-    delay(10);
-    return;
-  }
+  handleSerialDebug();
+  switch (st.screen) {
+    case Screen::HOME:
+      if (st.dirty) drawHome();
+      handleHomeTouch();
+      delay(10);
+      break;
 
-  // -------- PLAYER --------
-  handlePlayerTouch();
+    case Screen::SD_BROWSER:
+      if (st.dirty) drawSDBrowser();
+      handleSDBrowserTouch();
+      delay(10);
+      break;
 
-  // auto-hide OSD
-  if (st.osdVisible && st.playing && millis() - st.osdShownMs > OSD_TIMEOUT_MS) {
-    st.osdVisible = false;
-    // OSD regions get repainted by subsequent frames; force clear for pause case
-  }
-
-  if (st.playing) {
-    // frame pacing against wall clock
-    uint32_t due = st.startMs + (uint32_t)(st.frame * 1000.0f / st.idx.fps);
-    uint32_t now = millis();
-    if ((int32_t)(now - due) >= 0) {
-      int len = readNextFrame();
-      if (len <= 0) {                // end of video (or error)
-        stopPlayback();
-        return;
+    case Screen::SD_PLAYER: {
+      handleSDPlayerTouch();
+      if (st.osdVisible && st.playing && millis() - st.osdShownMs > OSD_TIMEOUT_MS) st.osdVisible = false;
+      if (st.playing) {
+        uint32_t due = st.startMs + (uint32_t)(st.frame * 1000.0f / st.idx.fps);
+        uint32_t now = millis();
+        if ((int32_t)(now - due) >= 0) {
+          int len = readNextSDFrame();
+          if (len <= 0) { stopSDPlayback(); break; }
+          if (jpeg.openRAM(frameBuf, len, jpegDraw)) {
+            prepareJPEGDecode();
+            int32_t behind = (int32_t)(millis() - due);
+            if (behind < (int32_t)(1000.0f / st.idx.fps) * 2) jpeg.decode(0, 0, 0);
+            jpeg.close();
+          }
+          st.frame++;
+        }
       }
-      // if we're badly behind (slow SD / big frame), drop frames to catch up
-      if (jpeg.openRAM(frameBuf, len, jpegDraw)) {
-        jpeg.setPixelType(RGB565_BIG_ENDIAN);
-        int32_t behind = (int32_t)(millis() - due);
-        if (behind < (int32_t)(1000.0f / st.idx.fps) * 2) {
-          jpeg.decode(0, 0, 0);
-        }                            // else: skip decode, just advance
-        jpeg.close();
+      if (st.osdVisible) drawSDOsd();
+      break;
+    }
+
+    case Screen::YT_BROWSER:
+      if (st.dirty) drawYTBrowser();
+      handleYTBrowserTouch();
+      delay(8);
+      break;
+
+    case Screen::YT_KEYBOARD:
+      if (st.dirty) drawYTKeyboard();
+      handleYTKeyboardTouch();
+      delay(8);
+      break;
+
+    case Screen::YT_PLAYER: {
+      handleYTPlayerTouch();
+      int len = readNextYTFrame();
+      if (len > 0) {
+        if (jpeg.openRAM(frameBuf, len, jpegDraw)) {
+          prepareJPEGDecode();
+          uint32_t d0 = micros();
+          ytDecodeInProgress = true;
+          int decOk = jpeg.decode(0, 30, 0);
+          ytDecodeInProgress = false;
+          ytDecodeUs += (uint32_t)(micros() - d0);
+          jpeg.close();
+          if (decOk) ytFramesDecoded++; else ytFramesDropped++;
+        } else {
+          ytFramesDropped++;
+        }
+      } else if (len == 0) {
+        ytMessage = "Stream ket thuc";
+        stopYTStream();
+        break;
+      } else {
+        // Timeout without a complete frame is not a fatal stream error.
+        // Return to the loop quickly so touch/UART remain responsive.
+        if (!ytStreamClient || !ytStreamClient->connected()) {
+          ytMessage = "Mat stream";
+          stopYTStream();
+          break;
+        }
       }
-      st.frame++;
+      if (st.osdVisible && millis() - st.osdShownMs > OSD_TIMEOUT_MS) st.osdVisible = false;
+      if (st.osdVisible) drawYTOSD();
+      break;
     }
   }
-
-  if (st.osdVisible) drawOsd();
 }

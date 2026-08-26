@@ -42,5 +42,5 @@
 #define VIDEO_DIR       "/videos"
 #define SEEK_STEP_SEC   60          // +/- jump per seek button press
 #define DEFAULT_VOLUME  12          // 0..21 (ESP32-audioI2S scale)
-#define DEFAULT_BRIGHT  220         // 0..255
+#define DEFAULT_BRIGHT  255         // 0..255
 #define OSD_TIMEOUT_MS  3000        // on-screen controls auto-hide
