@@ -57,6 +57,34 @@ struct PlayerState {
   int browserPage = 0;
 } st;
 
+enum class UiLanguage : uint8_t { VI = 0, EN = 1 };
+static UiLanguage uiLanguage = UiLanguage::VI;
+
+static const char *tr(const char *vi, const char *en) {
+  return uiLanguage == UiLanguage::VI ? vi : en;
+}
+
+static void saveLanguage() {
+  Preferences prefs;
+  if (!prefs.begin("cydlang", false)) return;
+  prefs.putUChar("lang", uiLanguage == UiLanguage::EN ? 1 : 0);
+  prefs.end();
+}
+
+static void loadLanguage() {
+  Preferences prefs;
+  if (!prefs.begin("cydlang", true)) { uiLanguage = UiLanguage::VI; return; }
+  uiLanguage = prefs.getUChar("lang", 0) == 1 ? UiLanguage::EN : UiLanguage::VI;
+  prefs.end();
+}
+
+static void setLanguage(UiLanguage lang) {
+  if (uiLanguage == lang) return;
+  uiLanguage = lang;
+  saveLanguage();
+  st.dirty = true;
+}
+
 struct YTItem {
   String id;
   String url;
@@ -71,7 +99,7 @@ static size_t frameBufSize = 0;
 static std::vector<String> videoList;
 static std::vector<YTItem> ytItems;
 static int ytScroll = 0;
-static String ytQuery = "music technology robots";
+static String ytQuery = "Tran Dang Khoa";
 static String ytServer;
 static String ytMessage;
 static String ytPlayingTitle;
@@ -86,6 +114,19 @@ static bool ytParserInJpeg = false;
 static int ytParserPrev = -1;
 static size_t ytParserN = 0;
 static uint32_t ytParserLastByteMs = 0;
+
+static constexpr int YT_FRAME_W = 320;
+static constexpr int YT_FRAME_H = 180;
+static constexpr int YT_VIDEO_Y = 30;
+static constexpr int YT_VIDEO_H = 180;
+static constexpr int YT_OSD_TOP_H = 28;
+static constexpr int YT_OSD_BOTTOM_Y = 216;
+static constexpr int YT_FRAME_PARTS = 2;
+static constexpr int YT_FRAME_PART_H = 90;
+static constexpr size_t YT_JPEG_INITIAL_BUF = 16 * 1024;
+static uint16_t *ytFramePart[YT_FRAME_PARTS] = {nullptr, nullptr};
+static bool ytFrameBufferEnabled = false;
+static bool ytOsdDirty = true;
 
 // Runtime diagnostics. touchDebugUntil enables bounded raw/calibrated touch logging.
 static uint32_t touchDebugUntil = 0;
@@ -142,12 +183,112 @@ static String fmtTime(uint32_t sec) {
   return String(b);
 }
 
+static size_t utf8Step(const String &s, size_t i) {
+  if (i >= s.length()) return s.length();
+  uint8_t c = (uint8_t)s[i];
+  size_t step = 1;
+  if ((c & 0xE0) == 0xC0) step = 2;
+  else if ((c & 0xF0) == 0xE0) step = 3;
+  else if ((c & 0xF8) == 0xF0) step = 4;
+  return min(s.length(), i + step);
+}
+
+static size_t utf8Count(const String &s) {
+  size_t count = 0;
+  for (size_t i = 0; i < s.length(); i = utf8Step(s, i)) ++count;
+  return count;
+}
+
+static size_t utf8ByteIndex(const String &s, size_t cpIndex) {
+  size_t i = 0, cp = 0;
+  while (i < s.length() && cp < cpIndex) { i = utf8Step(s, i); ++cp; }
+  return i;
+}
+
 static String shorten(const String &s, size_t n) {
-  if (s.length() <= n) return s;
-  return s.substring(0, n > 3 ? n - 3 : n) + "...";
+  const size_t count = utf8Count(s);
+  if (count <= n) return s;
+  const size_t keep = n > 3 ? n - 3 : n;
+  return s.substring(0, utf8ByteIndex(s, keep)) + "...";
+}
+
+static int copyYTDecodedBlock(JPEGDRAW *p) {
+  if (!ytFrameBufferEnabled || !p || !p->pPixels) return 0;
+  if (p->x < 0 || p->y < 0 || p->x >= YT_FRAME_W || p->y >= YT_FRAME_H) return 1;
+  const int copyW = min((int)p->iWidth, YT_FRAME_W - p->x);
+  const int copyH = min((int)p->iHeight, YT_FRAME_H - p->y);
+  const uint8_t *src = reinterpret_cast<const uint8_t *>(p->pPixels);
+
+  for (int row = 0; row < copyH; ++row) {
+    const int globalY = p->y + row;
+    const int part = globalY / YT_FRAME_PART_H;
+    const int localY = globalY % YT_FRAME_PART_H;
+    if (part < 0 || part >= YT_FRAME_PARTS || !ytFramePart[part]) continue;
+    uint8_t *dstBase = reinterpret_cast<uint8_t *>(ytFramePart[part]);
+    uint8_t *dst = dstBase + (localY * YT_FRAME_W + p->x) * sizeof(uint16_t);
+    memcpy(dst, src + row * p->iWidth * sizeof(uint16_t), copyW * sizeof(uint16_t));
+  }
+  return 1;
+}
+
+static void freeYTFrameBuffer() {
+  for (int i = 0; i < YT_FRAME_PARTS; ++i) {
+    if (ytFramePart[i]) {
+      free(ytFramePart[i]);
+      ytFramePart[i] = nullptr;
+    }
+  }
+  ytFrameBufferEnabled = false;
+}
+
+static bool allocateYTFrameBuffer() {
+  if (ytFrameBufferEnabled) return true;
+
+  if (frameBuf && frameBufSize > YT_JPEG_INITIAL_BUF) {
+    uint8_t *smaller = (uint8_t *)realloc(frameBuf, YT_JPEG_INITIAL_BUF);
+    if (smaller) {
+      frameBuf = smaller;
+      frameBufSize = YT_JPEG_INITIAL_BUF;
+    }
+  } else if (!frameBuf) {
+    ensureBuf(YT_JPEG_INITIAL_BUF);
+  }
+
+  const size_t partBytes = (size_t)YT_FRAME_W * YT_FRAME_PART_H * sizeof(uint16_t);
+  Serial.printf("[YTBUF] split alloc free=%u largest=%u part=%u x%d\n",
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap(), (unsigned)partBytes, YT_FRAME_PARTS);
+  for (int i = 0; i < YT_FRAME_PARTS; ++i) {
+    if (!ytFramePart[i]) ytFramePart[i] = (uint16_t *)malloc(partBytes);
+    if (!ytFramePart[i]) {
+      Serial.printf("[YTBUF] part %d FAILED free=%u largest=%u\n",
+                    i, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+      freeYTFrameBuffer();
+      Serial.println("[YTBUF] framebuffer=FALLBACK-DIRECT");
+      return false;
+    }
+    memset(ytFramePart[i], 0, partBytes);
+    Serial.printf("[YTBUF] part %d OK free=%u largest=%u\n",
+                  i, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  }
+  ytFrameBufferEnabled = true;
+  Serial.printf("[YTBUF] framebuffer=SPLIT-ON free=%u largest=%u\n",
+                ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+  return true;
+}
+
+static void presentYTFrame() {
+  if (!ytFrameBufferEnabled || !display()) return;
+  const uint32_t t0 = micros();
+  for (int i = 0; i < YT_FRAME_PARTS; ++i) {
+    if (!ytFramePart[i]) return;
+    display()->draw16bitBeRGBBitmap(0, YT_VIDEO_Y + i * YT_FRAME_PART_H,
+                                    ytFramePart[i], YT_FRAME_W, YT_FRAME_PART_H);
+  }
+  ytRenderUs += (uint32_t)(micros() - t0);
 }
 
 static int jpegDraw(JPEGDRAW *p) {
+  if (ytDecodeInProgress && ytFrameBufferEnabled) return copyYTDecodedBlock(p);
   uint32_t t0 = ytDecodeInProgress ? micros() : 0;
   int ok = jpegDrawCallback(p);
   if (ytDecodeInProgress) ytRenderUs += (uint32_t)(micros() - t0);
@@ -287,9 +428,9 @@ static void drawTouchCalibrationTarget(int x, int y, int index) {
   ui().fillScreen(TFT_BLACK);
   ui().setDatum(MC_DATUM);
   ui().setTextColor(TFT_WHITE, TFT_BLACK);
-  ui().text("HIEU CHUAN CAM UNG", 160, 82, 2);
+  ui().text(tr("HIỆU CHUẨN CẢM ỨNG", "TOUCH CALIBRATION"), 160, 82, 2);
   ui().setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-  ui().text(String("Cham dung dau +  ") + String(index + 1) + "/4", 160, 105, 1);
+  ui().text(String(tr("Chạm đúng dấu +  ", "Touch the +  ")) + String(index + 1) + "/4", 160, 105, 1);
   ui().fillRect(x - 14, y - 1, 29, 3, TFT_YELLOW);
   ui().fillRect(x - 1, y - 14, 3, 29, TFT_YELLOW);
   ui().drawRect(x - 6, y - 6, 13, 13, TFT_CYAN);
@@ -351,7 +492,7 @@ static void runTouchCalibration() {
       ui().fillScreen(TFT_BLACK);
       ui().setDatum(MC_DATUM);
       ui().setTextColor(TFT_RED, TFT_BLACK);
-      ui().text("CHAM LAI 4 DIEM", 160, 120, 2);
+      ui().text(tr("CHẠM LẠI 4 ĐIỂM", "TOUCH 4 POINTS AGAIN"), 160, 120, 2);
       delay(900);
       continue;
     }
@@ -361,7 +502,7 @@ static void runTouchCalibration() {
     ui().fillScreen(TFT_BLACK);
     ui().setDatum(MC_DATUM);
     ui().setTextColor(TFT_WHITE, TFT_BLACK);
-    ui().text("KIEM TRA TAM MAN HINH", 160, 82, 2);
+    ui().text(tr("KIỂM TRA TÂM MÀN HÌNH", "CHECK SCREEN CENTER"), 160, 82, 2);
     ui().fillRect(146, 119, 29, 3, TFT_YELLOW);
     ui().fillRect(159, 106, 3, 29, TFT_YELLOW);
     int crx = 0, cry = 0;
@@ -379,7 +520,7 @@ static void runTouchCalibration() {
                   touchCal.rawLeft, touchCal.rawRight, touchCal.rawTop, touchCal.rawBottom);
     ui().fillScreen(TFT_BLACK);
     ui().setTextColor(TFT_GREEN, TFT_BLACK);
-    ui().text("CAM UNG DA CHUAN", 160, 120, 2);
+    ui().text(tr("CẢM ỨNG ĐÃ CHUẨN", "TOUCH CALIBRATED"), 160, 120, 2);
     delay(700);
     st.dirty = true;
     return;
@@ -615,11 +756,11 @@ static void drawSDOsd() {
   }
   ui().setDatum(MC_DATUM);
   ui().setTextColor(TFT_WHITE, TFT_BLACK);
-  ui().text("BACK", 34, barY + 30, 2);
+  ui().text(tr("VỀ", "BACK"), 34, barY + 30, 2);
   ui().text("<< 1m", W / 2 - 70, barY + 30, 2);
   ui().text(st.playing ? "| |" : ">", W / 2, barY + 30, 4);
   ui().text("1m >>", W / 2 + 70, barY + 30, 2);
-  ui().text("VOL " + String(st.volume), W - 34, barY + 30, 2);
+  ui().text(String(tr("ÂM ", "VOL ")) + String(st.volume), W - 34, barY + 30, 2);
 }
 
 static void handleSDPlayerTouch() {
@@ -695,13 +836,13 @@ static const int ROWS_PER_PAGE = 6;
 
 static void drawSDBrowser() {
   ui().fillScreen(TFT_BLACK);
-  drawHeader("SD TV", true, sdReady ? "SD OK" : "NO SD");
+  drawHeader(tr("VIDEO THẺ SD", "SD VIDEO"), true, sdReady ? tr("SD OK", "SD OK") : tr("KHÔNG SD", "NO SD"));
   if (!sdReady) {
     ui().setDatum(MC_DATUM);
     ui().setTextColor(TFT_RED, TFT_BLACK);
-    ui().text("Khong co the SD", 160, 105, 4);
+    ui().text(tr("Không có thẻ SD", "No SD card"), 160, 105, 4);
     ui().setTextColor(TFT_DARKGREY, TFT_BLACK);
-    ui().text("YouTube TV van dung duoc", 160, 140, 2);
+    ui().text(tr("YouTube TV vẫn dùng được", "YouTube TV is still available"), 160, 140, 2);
     st.dirty = false;
     return;
   }
@@ -719,9 +860,9 @@ static void drawSDBrowser() {
   if (videoList.empty()) {
     ui().setDatum(MC_DATUM);
     ui().setTextColor(TFT_YELLOW, TFT_BLACK);
-    ui().text("Chua co video", 160, 110, 4);
+    ui().text(tr("Chưa có video", "No videos yet"), 160, 110, 4);
     ui().setTextColor(TFT_DARKGREY, TFT_BLACK);
-    ui().text("Copy .mjpeg/.mp3/.idx vao /videos", 160, 145, 2);
+    ui().text(tr("Chép .mjpeg/.mp3/.idx vào /videos", "Copy .mjpeg/.mp3/.idx to /videos"), 160, 145, 2);
   }
   int pages = (videoList.size() + ROWS_PER_PAGE - 1) / ROWS_PER_PAGE;
   if (pages > 1) {
@@ -800,10 +941,10 @@ static int scanWiFiAndShow(bool showOnScreen) {
     ui().fillScreen(TFT_BLACK);
     ui().setDatum(TL_DATUM);
     ui().setTextColor(TFT_CYAN, TFT_BLACK);
-    ui().text("CHON WIFI TREN DIEN THOAI", 8, 8, 2);
+    ui().text(tr("CHỌN WIFI TRÊN ĐIỆN THOẠI", "SELECT WIFI ON PHONE"), 8, 8, 2);
     ui().setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    ui().text("Ket noi AP: CYD-MiniTV-Setup", 8, 28, 2);
-    ui().text("Cac WiFi gan day:", 8, 50, 2);
+    ui().text(tr("Kết nối AP: CYD-MiniTV-Setup", "Connect AP: CYD-MiniTV-Setup"), 8, 28, 2);
+    ui().text(tr("Các WiFi gần đây:", "Nearby WiFi networks:"), 8, 50, 2);
     int rows = min(n, 6);
     for (int i = 0; i < rows; ++i) {
       uint16_t c = WiFi.RSSI(i) > -67 ? TFT_GREEN : (WiFi.RSSI(i) > -78 ? TFT_YELLOW : TFT_DARKGREY);
@@ -814,10 +955,10 @@ static int scanWiFiAndShow(bool showOnScreen) {
     }
     if (n <= 0) {
       ui().setTextColor(TFT_RED, TFT_BLACK);
-      ui().text("Khong quet thay SSID", 12, 80, 2);
+      ui().text(tr("Không quét thấy SSID", "No SSID found"), 12, 80, 2);
     }
     ui().setTextColor(TFT_WHITE, TFT_BLACK);
-    ui().text("Portal se hien danh sach SSID de bam chon", 8, 218, 1);
+    ui().text(tr("Portal sẽ hiện danh sách SSID để chọn", "Portal will show SSIDs to choose"), 8, 218, 1);
   }
   return n;
 }
@@ -950,7 +1091,7 @@ static bool scanSubnetForServer() {
   if (!(mask[0] == 255 && mask[1] == 255 && mask[2] == 255)) {
     Serial.printf("[SERVER] fallback /24 scan despite mask=%s\n", mask.toString().c_str());
   }
-  drawStatus("QUET LAN", "UDP khong thay - dang quet TCP...");
+  drawStatus(tr("QUÉT MẠNG LAN", "SCAN LAN"), tr("UDP không thấy - đang quét TCP...", "UDP failed - scanning TCP..."));
   Serial.printf("[SERVER] TCP fallback scan subnet %u.%u.%u.0/24 port 8765\n", local[0], local[1], local[2]);
 
   IPAddress gw = WiFi.gatewayIP();
@@ -984,7 +1125,7 @@ static bool discoverYTServer() {
   }
 
   logNetworkState("discovery-start");
-  drawStatus("TIM SERVER", "UDP broadcast + TCP fallback");
+  drawStatus(tr("TÌM MÁY CHỦ", "FIND SERVER"), tr("Phát UDP + dự phòng TCP", "UDP broadcast + TCP fallback"));
   discoveryUdp.stop();
   if (!discoveryUdp.begin(DISCOVERY_LOCAL_PORT)) {
     Serial.printf("[DISCOVERY] UDP begin failed local port=%u\n", DISCOVERY_LOCAL_PORT);
@@ -1018,7 +1159,7 @@ static bool discoverYTServer() {
     return true;
   }
 
-  ytMessage = "Khong tim thay server";
+  ytMessage = tr("Không tìm thấy máy chủ", "Server not found");
   Serial.println("[SERVER] FAIL: no CYD TV server found on UDP or TCP scan");
   return false;
 }
@@ -1030,6 +1171,7 @@ static bool ensureYTReady() {
 }
 
 static bool fetchYTList(const String &query, bool searchMode);
+static bool startYTDebugStream();
 
 static void rawSDProbe() {
   Serial.printf("[SDPROBE] pins CS=%d SCK=%d MISO=%d MOSI=%d idleMISO=%d\n",
@@ -1116,6 +1258,9 @@ static void handleSerialDebug() {
         Serial.printf("[UART] feed result=%d items=%u\n", feedOk ? 1 : 0, (unsigned)ytItems.size());
       }
       st.dirty = true;
+    } else if (cmd == "ytopen") {
+      bool ok = startYTDebugStream();
+      Serial.printf("[UART] ytopen result=%d server='%s'\n", ok ? 1 : 0, ytServer.c_str());
     } else if (cmd == "sdprobe") {
       rawSDProbe();
     } else if (cmd == "sd") {
@@ -1205,7 +1350,7 @@ static String urlEncode(const String &s) {
 static bool fetchYTList(const String &query, bool searchMode) {
   if (!ensureYTReady()) return false;
   ytFeedLoading = true;
-  drawStatus(searchMode ? "SEARCH" : "YOUTUBE", "Dang tai danh sach...");
+  drawStatus(searchMode ? tr("TÌM KIẾM", "SEARCH") : "YOUTUBE", tr("Đang tải danh sách...", "Loading list..."));
   HTTPClient http;
   String url = ytServer + (searchMode ? "/api/search?q=" : "/api/feed?q=") + urlEncode(query);
   http.setTimeout(20000);
@@ -1220,7 +1365,7 @@ static bool fetchYTList(const String &query, bool searchMode) {
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, payload);
   if (err || !doc["ok"].as<bool>()) {
-    ytMessage = err ? "JSON loi" : String((const char *)(doc["error"] | "Search loi"));
+    ytMessage = err ? tr("Lỗi JSON", "JSON error") : String((const char *)(doc["error"] | tr("Lỗi tìm kiếm", "Search failed")));
     ytFeedLoading = false; return false;
   }
   ytItems.clear();
@@ -1235,7 +1380,7 @@ static bool fetchYTList(const String &query, bool searchMode) {
     if (ytItems.size() >= 15) break;
   }
   ytScroll = 0;
-  ytMessage = ytItems.empty() ? "Khong co ket qua" : "";
+  ytMessage = ytItems.empty() ? tr("Không có kết quả", "No results") : "";
   ytFeedLoading = false;
   st.dirty = true;
   return !ytItems.empty();
@@ -1263,22 +1408,22 @@ static bool drawYTThumbnail(const YTItem &v, int x, int y) {
 static void drawYTBrowser() {
   ui().fillScreen(TFT_BLACK);
   String wifi = WiFi.status() == WL_CONNECTED ? "S" : "WIFI";
-  drawHeader("YouTube TV", true, "SEARCH");
+  drawHeader("YouTube TV", true, tr("TÌM", "SEARCH"));
   if (!ytServer.length()) {
     ui().setDatum(MC_DATUM);
     ui().setTextColor(TFT_YELLOW, TFT_BLACK);
-    ui().text("Chua co server", 160, 96, 4);
+    ui().text(tr("Chưa có máy chủ", "No server"), 160, 96, 4);
     ui().setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    ui().text(ytMessage.length() ? ytMessage : "Cham de ket noi", 160, 128, 2);
+    ui().text(ytMessage.length() ? ytMessage : tr("Chạm để kết nối", "Tap to connect"), 160, 128, 2);
     ui().drawRounded(80, 160, 160, 42, 8, TFT_CYAN);
-    ui().text("KET NOI", 160, 181, 2);
+    ui().text(tr("KẾT NỐI", "CONNECT"), 160, 181, 2);
     st.dirty = false;
     return;
   }
   if (ytItems.empty()) {
     ui().setDatum(MC_DATUM);
     ui().setTextColor(TFT_YELLOW, TFT_BLACK);
-    ui().text(ytMessage.length() ? ytMessage : "Dang tai...", 160, 110, 4);
+    ui().text(ytMessage.length() ? ytMessage : tr("Đang tải...", "Loading..."), 160, 110, 4);
     ui().setTextColor(TFT_LIGHTGREY, TFT_BLACK);
     ui().text("Server: " + ytServer.substring(7), 160, 145, 2);
     st.dirty = false;
@@ -1299,7 +1444,7 @@ static void drawYTBrowser() {
     ui().setDatum(TL_DATUM);
     ui().setTextColor(TFT_WHITE, ui().color565(9, 10, 13));
     ui().text(shorten(v.title, 27), 106, y + 5, 2);
-    String line2 = v.title.length() > 27 ? shorten(v.title.substring(24), 27) : "";
+    String line2 = utf8Count(v.title) > 27 ? shorten(v.title.substring(utf8ByteIndex(v.title, 24)), 27) : "";
     if (line2.length()) ui().text(line2, 106, y + 23, 2);
     ui().setTextColor(TFT_DARKGREY, ui().color565(9, 10, 13));
     String meta = shorten(v.channel, 18);
@@ -1336,7 +1481,7 @@ static void handleYTBrowserTouch() {
       st.dirty = true;
     } else if (downY < 34) {
       if (downX < 62) { st.screen = Screen::HOME; st.dirty = true; }
-      else if (downX > 235) { st.screen = Screen::YT_KEYBOARD; st.dirty = true; }
+      else if (downX > 210) { st.screen = Screen::YT_KEYBOARD; st.dirty = true; }
     } else if (!ytServer.length()) {
       if (downY > 145) { ytServer = ""; if (ensureYTReady()) fetchYTList(ytQuery, false); st.dirty = true; }
     } else {
@@ -1349,7 +1494,7 @@ static void handleYTBrowserTouch() {
         YTItem chosen = ytItems[idx];
         // close existing stream before opening new one
         if (ytStreamActive) { ytStreamHttp.end(); ytStreamActive = false; }
-        drawStatus("DANG MO VIDEO", shorten(chosen.title, 28));
+        drawStatus(tr("ĐANG MỞ VIDEO", "OPENING VIDEO"), shorten(chosen.title, 28));
         HTTPClient cmd;
         if (cmd.begin(ytServer + "/api/play")) {
           cmd.addHeader("Content-Type", "application/json");
@@ -1360,6 +1505,9 @@ static void handleYTBrowserTouch() {
           int rc = cmd.POST(body);
           cmd.end();
           if (rc >= 200 && rc < 300) {
+            allocateYTFrameBuffer();
+            ytStreamHttp.useHTTP10(true);
+            ytStreamHttp.useHTTP10(true);
             ytStreamHttp.setTimeout(10000);
             if (ytStreamHttp.begin(ytServer + "/stream.mjpg")) {
               int sc = ytStreamHttp.GET();
@@ -1376,6 +1524,7 @@ static void handleYTBrowserTouch() {
                 st.screen = Screen::YT_PLAYER;
                 st.osdVisible = true;
                 st.osdShownMs = millis();
+                ytOsdDirty = true;
                 ui().fillScreen(TFT_BLACK);
               } else { ytStreamHttp.end(); ytMessage = "Stream HTTP " + String(sc); st.dirty = true; }
             }
@@ -1388,32 +1537,87 @@ static void handleYTBrowserTouch() {
 }
 
 // -----------------------------------------------------------------------------
-// Search keyboard
+// Search keyboard - phone-style QWERTY
 // -----------------------------------------------------------------------------
-static const char *KB[32] = {
-  "A","B","C","D","E","F","G","H",
-  "I","J","K","L","M","N","O","P",
-  "Q","R","S","T","U","V","W","X",
-  "Y","Z","<-","SP","GO","CLR","BACK","."
+static const char KB_ROW1[] = "QWERTYUIOP";
+static const char KB_ROW2[] = "ASDFGHJKL";
+static const char KB_ROW3[] = "ZXCVBNM";
+
+enum class KeyboardAction : uint8_t { CHAR_KEY, BACKSPACE, SPACE, SEARCH, CLEAR, BACK, DOT };
+struct KeyboardKey {
+  int16_t x, y, w, h;
+  KeyboardAction action;
+  char value;
 };
+
+static int buildKeyboardKeys(KeyboardKey *out, int maxKeys) {
+  int n = 0;
+  auto add = [&](int x, int y, int w, int h, KeyboardAction action, char value = 0) {
+    if (n < maxKeys) out[n++] = {(int16_t)x, (int16_t)y, (int16_t)w, (int16_t)h, action, value};
+  };
+
+  // Row 1: QWERTYUIOP
+  for (int i = 0; i < 10; ++i) add(1 + i * 32, 76, 30, 34, KeyboardAction::CHAR_KEY, KB_ROW1[i]);
+  // Row 2: ASDFGHJKL, centered like a phone keyboard.
+  for (int i = 0; i < 9; ++i) add(8 + i * 34, 112, 32, 34, KeyboardAction::CHAR_KEY, KB_ROW2[i]);
+  // Row 3: ZXCVBNM + backspace.
+  for (int i = 0; i < 7; ++i) add(9 + i * 36, 148, 34, 34, KeyboardAction::CHAR_KEY, KB_ROW3[i]);
+  add(261, 148, 50, 34, KeyboardAction::BACKSPACE);
+  // Bottom row: Back / dot / space / clear / search.
+  add(4,   186, 50, 48, KeyboardAction::BACK);
+  add(56,  186, 34, 48, KeyboardAction::DOT);
+  add(92,  186, 104, 48, KeyboardAction::SPACE);
+  add(198, 186, 50, 48, KeyboardAction::CLEAR);
+  add(250, 186, 66, 48, KeyboardAction::SEARCH);
+  return n;
+}
+
+static bool hitKeyboardKey(int x, int y, KeyboardKey &hit) {
+  KeyboardKey keys[40];
+  const int count = buildKeyboardKeys(keys, 40);
+  for (int i = 0; i < count; ++i) {
+    const KeyboardKey &k = keys[i];
+    if (x >= k.x && x < k.x + k.w && y >= k.y && y < k.y + k.h) {
+      hit = k;
+      return true;
+    }
+  }
+  return false;
+}
+
+static String keyboardKeyLabel(const KeyboardKey &k) {
+  switch (k.action) {
+    case KeyboardAction::CHAR_KEY: return String(k.value);
+    case KeyboardAction::BACKSPACE: return "<-";
+    case KeyboardAction::SPACE: return tr("CÁCH", "SPACE");
+    case KeyboardAction::SEARCH: return tr("TÌM", "SEARCH");
+    case KeyboardAction::CLEAR: return tr("XÓA", "CLEAR");
+    case KeyboardAction::BACK: return tr("VỀ", "BACK");
+    case KeyboardAction::DOT: return ".";
+  }
+  return "";
+}
 
 static void drawYTKeyboard() {
   ui().fillScreen(TFT_BLACK);
-  drawHeader("Search YouTube", true);
+  drawHeader(tr("Tìm kiếm video", "Search videos"), true);
   ui().fillRounded(6, 38, 308, 34, 5, ui().color565(24, 27, 32));
   ui().setDatum(ML_DATUM);
   ui().setTextColor(TFT_WHITE, ui().color565(24, 27, 32));
   ui().text(shorten(ytQuery, 36), 12, 55, 2);
-  const int keyY = 76;
-  const int keyH = 40;
-  for (int i = 0; i < 32; ++i) {
-    int col = i % 8, row = i / 8;
-    int x = col * 40, y = keyY + row * keyH;
-    uint16_t bg = (i == 28) ? ui().color565(170, 0, 0) : ui().color565(28, 31, 37);
-    ui().fillRounded(x + 2, y + 2, 36, 36, 4, bg);
+
+  KeyboardKey keys[40];
+  const int count = buildKeyboardKeys(keys, 40);
+  for (int i = 0; i < count; ++i) {
+    const KeyboardKey &k = keys[i];
+    uint16_t bg = ui().color565(28, 31, 37);
+    if (k.action == KeyboardAction::SEARCH) bg = ui().color565(0, 105, 150);
+    else if (k.action == KeyboardAction::BACKSPACE || k.action == KeyboardAction::CLEAR) bg = ui().color565(58, 61, 67);
+    ui().fillRounded(k.x + 1, k.y + 1, k.w - 2, k.h - 2, 5, bg);
     ui().setDatum(MC_DATUM);
     ui().setTextColor(TFT_WHITE, bg);
-    ui().text(KB[i], x + 20, y + 20, i >= 26 ? 1 : 2);
+    const uint8_t textSize = k.action == KeyboardAction::CHAR_KEY ? 2 : 1;
+    ui().text(keyboardKeyLabel(k), k.x + k.w / 2, k.y + k.h / 2, textSize);
   }
   st.dirty = false;
 }
@@ -1426,20 +1630,40 @@ static void handleYTKeyboardTouch() {
   if (down) { lastX = x; lastY = y; }
   if (!down && wasDown) {
     x = lastX; y = lastY;
-    if (y < 34 && x < 60) { st.screen = Screen::YT_BROWSER; st.dirty = true; }
-    else if (y >= 76) {
-      int col = constrain(x / 40, 0, 7);
-      int row = constrain((y - 76) / 40, 0, 3);
-      int i = row * 8 + col;
-      if (i >= 0 && i < 26) { if (ytQuery.length() < 48) ytQuery += KB[i]; }
-      else if (i == 26) { if (ytQuery.length()) ytQuery.remove(ytQuery.length() - 1); }
-      else if (i == 27) { if (ytQuery.length() < 48) ytQuery += ' '; }
-      else if (i == 28) {
-        if (ytQuery.length()) { st.screen = Screen::YT_BROWSER; fetchYTList(ytQuery, true); st.dirty = true; }
-      } else if (i == 29) ytQuery = "";
-      else if (i == 30) { st.screen = Screen::YT_BROWSER; st.dirty = true; }
-      else if (i == 31) { if (ytQuery.length() < 48) ytQuery += '.'; }
+    if (y < 34 && x < 60) {
+      st.screen = Screen::YT_BROWSER;
       st.dirty = true;
+    } else {
+      KeyboardKey k{};
+      if (hitKeyboardKey(x, y, k)) {
+        switch (k.action) {
+          case KeyboardAction::CHAR_KEY:
+            if (ytQuery.length() < 48) ytQuery += k.value;
+            break;
+          case KeyboardAction::BACKSPACE:
+            if (ytQuery.length()) ytQuery.remove(ytQuery.length() - 1);
+            break;
+          case KeyboardAction::SPACE:
+            if (ytQuery.length() < 48) ytQuery += ' ';
+            break;
+          case KeyboardAction::DOT:
+            if (ytQuery.length() < 48) ytQuery += '.';
+            break;
+          case KeyboardAction::CLEAR:
+            ytQuery = "";
+            break;
+          case KeyboardAction::BACK:
+            st.screen = Screen::YT_BROWSER;
+            break;
+          case KeyboardAction::SEARCH:
+            if (ytQuery.length()) {
+              st.screen = Screen::YT_BROWSER;
+              fetchYTList(ytQuery, true);
+            }
+            break;
+        }
+        st.dirty = true;
+      }
     }
   }
   wasDown = down;
@@ -1450,7 +1674,7 @@ static void handleYTKeyboardTouch() {
 // -----------------------------------------------------------------------------
 static int readNextYTFrame() {
   if (!ytStreamActive || !ytStreamClient) return -1;
-  if (!ensureBuf(64 * 1024)) return -1;
+  if (!ensureBuf(YT_JPEG_INITIAL_BUF)) return -1;
 
   // If a partial JPEG has stalled for too long, discard only that partial frame and
   // resynchronise at the next SOI. This prevents a single dropped packet freezing TV.
@@ -1509,6 +1733,39 @@ static int readNextYTFrame() {
   return -1;
 }
 
+static bool startYTDebugStream() {
+  if (!ensureYTReady()) return false;
+  allocateYTFrameBuffer();
+  if (ytStreamActive) {
+    ytStreamHttp.end();
+    ytStreamActive = false;
+  }
+  ytStreamHttp.setTimeout(10000);
+  if (!ytStreamHttp.begin(ytServer + "/stream.mjpg")) return false;
+  int sc = ytStreamHttp.GET();
+  if (sc != HTTP_CODE_OK) {
+    Serial.printf("[YTDBG] stream HTTP=%d\n", sc);
+    ytStreamHttp.end();
+    return false;
+  }
+  ytStreamClient = ytStreamHttp.getStreamPtr();
+  ytStreamActive = true;
+  ytParserInJpeg = false;
+  ytParserPrev = -1;
+  ytParserN = 0;
+  ytParserLastByteMs = millis();
+  ytStatsStartMs = millis();
+  ytFramesRx = ytFramesDecoded = ytFramesDropped = 0;
+  ytJpegBytes = ytDecodeUs = ytRenderUs = 0;
+  st.screen = Screen::YT_PLAYER;
+  st.osdVisible = true;
+  st.osdShownMs = millis();
+  ytOsdDirty = true;
+  ui().fillScreen(TFT_BLACK);
+  Serial.println("[YTDBG] stream opened");
+  return true;
+}
+
 static void stopYTStream() {
   if (ytStreamActive) ytStreamHttp.end();
   ytStreamActive = false;
@@ -1522,16 +1779,24 @@ static void stopYTStream() {
 }
 
 static void drawYTOSD() {
-  ui().fillRect(0, 0, 320, 28, TFT_BLACK);
+  ui().fillRect(0, 0, 320, YT_OSD_TOP_H, TFT_BLACK);
   ui().setDatum(ML_DATUM);
   ui().setTextColor(TFT_WHITE, TFT_BLACK);
-  ui().text("< BACK", 6, 14, 2);
+  ui().text(tr("< VỀ", "< BACK"), 6, 14, 2);
   ui().setDatum(MR_DATUM);
-  ui().text(shorten(ytPlayingTitle, 27), 314, 14, 2);
-  ui().fillRect(0, 216, 320, 24, TFT_BLACK);
+  ui().setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  const String playingTitle = ytPlayingTitle.length() ? shorten(ytPlayingTitle, 34)
+                                                       : tr("Đang phát video", "Playing video");
+  ui().text(playingTitle, 314, 14, 1);
+  ui().fillRect(0, YT_OSD_BOTTOM_Y, 320, 24, TFT_BLACK);
   ui().setDatum(MC_DATUM);
   ui().setTextColor(TFT_YELLOW, TFT_BLACK);
-  ui().text("YouTube via LAN  |  VIDEO ONLY", 160, 228, 2);
+  ui().text("YouTube", 160, 228, 2);
+}
+
+static void clearYTOSD() {
+  ui().fillRect(0, 0, 320, YT_OSD_TOP_H, TFT_BLACK);
+  ui().fillRect(0, YT_OSD_BOTTOM_Y, 320, 24, TFT_BLACK);
 }
 
 static void handleYTPlayerTouch() {
@@ -1570,6 +1835,7 @@ static void handleYTPlayerTouch() {
     } else {
       st.osdVisible = !st.osdVisible;
       st.osdShownMs = millis();
+      ytOsdDirty = true;
       Serial.printf("[TOUCH] YT OSD=%d x=%d y=%d\n", st.osdVisible ? 1 : 0, downX, downY);
     }
   }
@@ -1580,23 +1846,38 @@ static void handleYTPlayerTouch() {
 // Home
 // -----------------------------------------------------------------------------
 static void drawHome() {
-  ui().fillScreen(ui().color565(5, 7, 11));
+  const uint16_t bg = ui().color565(5, 7, 11);
+  ui().fillScreen(bg);
+
+  // Language selector is always visible on the home screen.
+  const uint16_t viBg = uiLanguage == UiLanguage::VI ? ui().color565(0, 105, 150) : ui().color565(28, 31, 37);
+  const uint16_t enBg = uiLanguage == UiLanguage::EN ? ui().color565(0, 105, 150) : ui().color565(28, 31, 37);
+  ui().fillRounded(184, 3, 76, 22, 5, viBg);
+  ui().fillRounded(264, 3, 52, 22, 5, enBg);
   ui().setDatum(MC_DATUM);
-  ui().setTextColor(TFT_WHITE, ui().color565(5, 7, 11));
-  ui().text("CYD MINI TV", 160, 30, 4);
-  ui().setTextColor(TFT_DARKGREY, ui().color565(5, 7, 11));
-  ui().text("ESP32-2432S028R", 160, 54, 2);
+  ui().setTextColor(TFT_WHITE, viBg);
+  ui().text("TIẾNG VIỆT", 222, 14, 1);
+  ui().setTextColor(TFT_WHITE, enBg);
+  ui().text("ENGLISH", 290, 14, 1);
+
+  ui().setTextColor(TFT_WHITE, bg);
+  ui().text(tr("MINI TIVI", "MINI TV"), 160, 39, 3);
+  ui().setTextColor(TFT_LIGHTGREY, bg);
+  ui().text(tr("Trần Đăng Khoa", "Tran Dang Khoa"), 160, 62, 2);
+
   ui().fillRounded(18, 78, 284, 60, 10, ui().color565(22, 26, 34));
   ui().fillRounded(18, 150, 284, 60, 10, ui().color565(134, 0, 0));
   ui().setTextColor(TFT_CYAN, ui().color565(22, 26, 34));
-  ui().text("SD VIDEO", 160, 102, 4);
+  ui().text(tr("VIDEO THẺ SD", "SD VIDEO"), 160, 102, 3);
   ui().setTextColor(TFT_LIGHTGREY, ui().color565(22, 26, 34));
-  ui().text(sdReady ? "MJPEG + MP3" : "No SD - van vao duoc", 160, 125, 1);
+  ui().text(sdReady ? tr("MJPEG + MP3 sẵn sàng", "MJPEG + MP3 ready")
+                    : tr("Không có SD - vẫn vào được", "No SD - menu still available"), 160, 126, 1);
   ui().setTextColor(TFT_WHITE, ui().color565(134, 0, 0));
-  ui().text("YOUTUBE TV", 160, 174, 4);
-  ui().text("Swipe feed / Search / Tap to play", 160, 198, 1);
-  ui().setTextColor(WiFi.status() == WL_CONNECTED ? TFT_GREEN : TFT_DARKGREY, ui().color565(5, 7, 11));
-  ui().text(WiFi.status() == WL_CONNECTED ? ("WiFi " + WiFi.localIP().toString()) : "WiFi setup khi vao YouTube", 160, 228, 1);
+  ui().text("YOUTUBE TV", 160, 174, 3);
+  ui().text(tr("Vuốt / Tìm kiếm / Chạm để phát", "Swipe / Search / Tap to play"), 160, 199, 1);
+  ui().setTextColor(WiFi.status() == WL_CONNECTED ? TFT_GREEN : TFT_DARKGREY, bg);
+  ui().text(WiFi.status() == WL_CONNECTED ? ("WiFi " + WiFi.localIP().toString())
+                                          : tr("Thiết lập WiFi khi vào YouTube", "WiFi setup when opening YouTube"), 160, 228, 1);
   st.dirty = false;
 }
 
@@ -1609,7 +1890,11 @@ static void handleHomeTouch() {
   if (!down && wasDown) {
     x = lastX; y = lastY;
     Serial.printf("[TOUCH][HOME] x=%d y=%d\n", x, y);
-    if (y >= 70 && y < 145) { st.screen = Screen::SD_BROWSER; st.dirty = true; }
+    if (y < 32 && x >= 180) {
+      if (x < 262) setLanguage(UiLanguage::VI);
+      else setLanguage(UiLanguage::EN);
+      st.dirty = true;
+    } else if (y >= 70 && y < 145) { st.screen = Screen::SD_BROWSER; st.dirty = true; }
     else if (y >= 145 && y < 220) enterYouTube();
   }
   wasDown = down;
@@ -1617,6 +1902,7 @@ static void handleHomeTouch() {
 
 void setup() {
   Serial.begin(115200);
+  loadLanguage();
   ledcSetup(BL_CHANNEL, BL_FREQ, BL_RES_BITS);
   ledcAttachPin(BL_PIN, BL_CHANNEL);
   setBrightness(DEFAULT_BRIGHT);
@@ -1722,35 +2008,60 @@ void loop() {
 
     case Screen::YT_PLAYER: {
       handleYTPlayerTouch();
+      static uint32_t ytAutoStatMs = 0;
+      if (millis() - ytAutoStatMs >= 1000) {
+        ytAutoStatMs = millis();
+        uint32_t ms = ytStatsStartMs ? millis() - ytStatsStartMs : 0;
+        float fpsNow = ms ? (ytFramesDecoded * 1000.0f / ms) : 0.0f;
+        float decMs = ytFramesDecoded ? (ytDecodeUs / 1000.0f / ytFramesDecoded) : 0.0f;
+        float renMs = ytFramesDecoded ? (ytRenderUs / 1000.0f / ytFramesDecoded) : 0.0f;
+        Serial.printf("[YTSTAT] t=%lums rx=%lu dec=%lu drop=%lu fps=%.2f decMs=%.1f renMs=%.1f avail=%d conn=%d partial=%u heap=%u\n",
+                      (unsigned long)ms, (unsigned long)ytFramesRx, (unsigned long)ytFramesDecoded,
+                      (unsigned long)ytFramesDropped, fpsNow, decMs, renMs,
+                      ytStreamClient ? ytStreamClient->available() : -1,
+                      (ytStreamClient && ytStreamClient->connected()) ? 1 : 0,
+                      (unsigned)ytParserN, ESP.getFreeHeap());
+      }
       int len = readNextYTFrame();
       if (len > 0) {
         if (jpeg.openRAM(frameBuf, len, jpegDraw)) {
           prepareJPEGDecode();
           uint32_t d0 = micros();
           ytDecodeInProgress = true;
-          int decOk = jpeg.decode(0, 30, 0);
+          int decOk = jpeg.decode(0, ytFrameBufferEnabled ? 0 : YT_VIDEO_Y, 0);
           ytDecodeInProgress = false;
           ytDecodeUs += (uint32_t)(micros() - d0);
           jpeg.close();
-          if (decOk) ytFramesDecoded++; else ytFramesDropped++;
+          if (decOk) {
+            if (ytFrameBufferEnabled) presentYTFrame();
+            ytFramesDecoded++;
+          } else {
+            ytFramesDropped++;
+          }
         } else {
           ytFramesDropped++;
         }
       } else if (len == 0) {
-        ytMessage = "Stream ket thuc";
+        ytMessage = tr("Luồng đã kết thúc", "Stream ended");
         stopYTStream();
         break;
       } else {
         // Timeout without a complete frame is not a fatal stream error.
         // Return to the loop quickly so touch/UART remain responsive.
         if (!ytStreamClient || !ytStreamClient->connected()) {
-          ytMessage = "Mat stream";
+          ytMessage = tr("Mất luồng video", "Stream lost");
           stopYTStream();
           break;
         }
       }
-      if (st.osdVisible && millis() - st.osdShownMs > OSD_TIMEOUT_MS) st.osdVisible = false;
-      if (st.osdVisible) drawYTOSD();
+      if (st.osdVisible && millis() - st.osdShownMs > OSD_TIMEOUT_MS) {
+        st.osdVisible = false;
+        ytOsdDirty = true;
+      }
+      if (ytOsdDirty) {
+        if (st.osdVisible) drawYTOSD(); else clearYTOSD();
+        ytOsdDirty = false;
+      }
       break;
     }
   }

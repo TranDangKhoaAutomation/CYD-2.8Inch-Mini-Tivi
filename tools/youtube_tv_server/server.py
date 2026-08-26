@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import queue
 import socket
 import subprocess
 import threading
@@ -20,6 +21,10 @@ HOST = "0.0.0.0"
 PORT = int(os.environ.get("CYD_TV_PORT", "8876"))
 DISCOVERY_PORT = 4210
 DISCOVERY_MAGIC = b"CYD_TV_DISCOVER"
+YT_STREAM_FPS = 6
+YT_STREAM_Q = 6
+YT_PREBUFFER_FRAMES = 24   # 4 seconds at 6 fps before playback starts
+YT_BUFFER_FRAMES = 120     # up to 20 seconds of jitter absorption on the PC
 BASE_DIR = Path(__file__).resolve().parent
 YTDLP_EXE = BASE_DIR / "yt-dlp.exe"
 CACHE_DIR = BASE_DIR / "cache"
@@ -78,7 +83,7 @@ def _run_ytdlp_json(args: list[str], timeout: int = 35) -> dict[str, Any]:
 
 
 def search_youtube(query: str, limit: int = 12) -> list[VideoItem]:
-    query = (query or "").strip() or "music technology robots"
+    query = (query or "").strip() or "Tran Dang Khoa"
     info = _run_ytdlp_json([
         "--flat-playlist",
         "--dump-single-json",
@@ -103,7 +108,7 @@ def resolve_direct_media(url: str) -> tuple[str, str]:
     info = _run_ytdlp_json([
         "--dump-single-json",
         "--no-playlist",
-        "-f", "bestvideo[height<=720][ext=mp4]/bestvideo[height<=720]/bestvideo",
+        "-f", "bestvideo[height<=480][ext=mp4][vcodec^=avc1][protocol=https]/bestvideo[height<=480][protocol=https]/bestvideo[height<=480]",
         url,
     ], timeout=60)
     direct = info.get("url")
@@ -166,8 +171,54 @@ def _drain_ffmpeg_stderr(pipe) -> None:
         print(f"[FFMPEG] stderr drain stopped: {exc}", flush=True)
 
 
+def _mjpeg_producer(proc: subprocess.Popen[bytes], frame_queue: "queue.Queue[bytes]", stop_event: threading.Event) -> None:
+    """Read/transcode ahead of playback and keep an ordered PC-side frame reservoir."""
+    assert proc.stdout is not None
+    buf = bytearray()
+    produced = 0
+    last_frame_at = time.monotonic()
+    try:
+        while not stop_event.is_set():
+            chunk = proc.stdout.read(8192)
+            if not chunk:
+                break
+            buf.extend(chunk)
+            while not stop_event.is_set():
+                soi = buf.find(b"\xff\xd8")
+                if soi < 0:
+                    if len(buf) > 16384:
+                        del buf[:-2]
+                    break
+                eoi = buf.find(b"\xff\xd9", soi + 2)
+                if eoi < 0:
+                    if soi > 0:
+                        del buf[:soi]
+                    break
+                frame = bytes(buf[soi:eoi + 2])
+                del buf[:eoi + 2]
+                gap = time.monotonic() - last_frame_at
+                last_frame_at = time.monotonic()
+                if gap > 1.0:
+                    print(f"[BUFFER] source gap {gap:.2f}s after frame {produced}", flush=True)
+                while not stop_event.is_set():
+                    try:
+                        frame_queue.put(frame, timeout=0.25)
+                        produced += 1
+                        break
+                    except queue.Full:
+                        # A full queue is intentional: it means the PC has a deep reserve.
+                        continue
+    except Exception as exc:
+        print(f"[BUFFER] producer stopped: {exc}", flush=True)
+    finally:
+        print(f"[BUFFER] producer exit frames={produced} queued={frame_queue.qsize()}", flush=True)
+
+
 def mjpeg_generator():
     proc: subprocess.Popen[bytes] | None = None
+    stop_event = threading.Event()
+    producer: threading.Thread | None = None
+    frame_queue: "queue.Queue[bytes]" = queue.Queue(maxsize=YT_BUFFER_FRAMES)
     try:
         direct, title = resolve_selected()
         cmd = [
@@ -177,13 +228,13 @@ def mjpeg_generator():
             "-reconnect", "1",
             "-reconnect_streamed", "1",
             "-reconnect_delay_max", "2",
-            # Pace VOD input at real-time speed. Without -re, ffmpeg can produce
-            # nominal 10-fps video much faster than wall-clock time and flood the ESP32 TCP buffer.
-            "-re",
+            "-rw_timeout", "10000000",
             "-i", direct,
             "-an",
-            "-vf", "scale=320:180:force_original_aspect_ratio=decrease:flags=lanczos,pad=320:180:(ow-iw)/2:(oh-ih)/2:black,unsharp=3:3:0.30:3:3:0.0,fps=10",
-            "-q:v", "3",
+            # 320x180 is the panel's actual video area. Decode a modest progressive source,
+            # transcode ahead on the PC, then pace the already-buffered JPEGs to the ESP32.
+            "-vf", f"scale=320:180:force_original_aspect_ratio=decrease:flags=fast_bilinear,pad=320:180:(ow-iw)/2:(oh-ih)/2:black,fps={YT_STREAM_FPS}",
+            "-q:v", str(YT_STREAM_Q),
             "-f", "mjpeg",
             "pipe:1",
         ]
@@ -194,40 +245,57 @@ def mjpeg_generator():
             state["title"] = title
             state["error"] = ""
 
-        assert proc.stdout is not None
         if proc.stderr is not None:
             threading.Thread(target=_drain_ffmpeg_stderr, args=(proc.stderr,), daemon=True).start()
-        buf = bytearray()
-        while True:
-            chunk = proc.stdout.read(4096)
-            if not chunk:
+        producer = threading.Thread(target=_mjpeg_producer, args=(proc, frame_queue, stop_event), daemon=True)
+        producer.start()
+
+        # Build a few seconds of reserve before the first frame is emitted. Without -re,
+        # ffmpeg can continue filling the deeper queue in the background while playback runs.
+        prebuffer_started = time.monotonic()
+        while frame_queue.qsize() < YT_PREBUFFER_FRAMES and producer.is_alive():
+            if time.monotonic() - prebuffer_started > 12.0:
                 break
-            buf.extend(chunk)
-            while True:
-                soi = buf.find(b"\xff\xd8")
-                if soi < 0:
-                    if len(buf) > 8192:
-                        del buf[:-2]
-                    break
-                eoi = buf.find(b"\xff\xd9", soi + 2)
-                if eoi < 0:
-                    if soi > 0:
-                        del buf[:soi]
-                    break
-                frame = bytes(buf[soi:eoi + 2])
-                del buf[:eoi + 2]
-                yield b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(frame)).encode() + b"\r\n\r\n" + frame + b"\r\n"
+            time.sleep(0.05)
+        print(f"[BUFFER] playback start queued={frame_queue.qsize()}/{YT_BUFFER_FRAMES}", flush=True)
+
+        period = 1.0 / YT_STREAM_FPS
+        next_emit = time.monotonic()
+        sent = 0
+        while True:
+            if not producer.is_alive() and frame_queue.empty():
+                break
+            try:
+                frame = frame_queue.get(timeout=2.0)
+            except queue.Empty:
+                print("[BUFFER] underrun: no frame for 2.0s", flush=True)
+                continue
+
+            now = time.monotonic()
+            if next_emit > now:
+                time.sleep(next_emit - now)
+            else:
+                # Do not accumulate timing debt after an occasional slow client write.
+                next_emit = now
+            yield b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: " + str(len(frame)).encode() + b"\r\n\r\n" + frame + b"\r\n"
+            sent += 1
+            next_emit += period
+            if sent % (YT_STREAM_FPS * 5) == 0:
+                print(f"[BUFFER] sent={sent} queued={frame_queue.qsize()}", flush=True)
     except GeneratorExit:
         pass
     except Exception as exc:
         _set_error(str(exc))
     finally:
+        stop_event.set()
         if proc and proc.poll() is None:
             proc.terminate()
             try:
                 proc.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 proc.kill()
+        if producer and producer.is_alive():
+            producer.join(timeout=1)
         with state_lock:
             state["running"] = False
 
@@ -295,7 +363,7 @@ def api_play():
 
 @app.get("/api/feed")
 def api_feed():
-    q = request.args.get("q", "music technology robots")
+    q = request.args.get("q", "Tran Dang Khoa")
     try:
         items = search_youtube(q, 12)
         return jsonify({"ok": True, "query": q, "items": [asdict(x) for x in items]})

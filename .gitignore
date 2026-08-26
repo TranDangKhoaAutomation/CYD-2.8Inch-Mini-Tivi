@@ -1,3 +1,5 @@
 .pio/
 .vscode/
 *.bin
+.superpowers/
+tools/youtube_tv_server/cache/
