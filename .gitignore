@@ -3,3 +3,5 @@
 *.bin
 .superpowers/
 tools/youtube_tv_server/cache/
+__pycache__/
+*.pyc

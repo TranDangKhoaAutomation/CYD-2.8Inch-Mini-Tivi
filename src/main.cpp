@@ -36,6 +36,7 @@ enum class Screen {
   SD_PLAYER,
   YT_BROWSER,
   YT_KEYBOARD,
+  TV_BROWSER,
   YT_PLAYER
 };
 
@@ -93,16 +94,26 @@ struct YTItem {
   uint32_t duration = 0;
 };
 
+struct TVItem {
+  String id;
+  String name;
+};
+
 static bool sdReady = false;
 static uint8_t *frameBuf = nullptr;
 static size_t frameBufSize = 0;
 static std::vector<String> videoList;
 static std::vector<YTItem> ytItems;
+static std::vector<TVItem> tvItems;
 static int ytScroll = 0;
+static int tvScroll = 0;
 static String ytQuery = "Tran Dang Khoa";
 static String ytServer;
 static String ytMessage;
 static String ytPlayingTitle;
+static String remoteSourceLabel = "YouTube";
+static Screen remoteReturnScreen = Screen::YT_BROWSER;
+static String tvMessage;
 static bool ytFeedLoading = false;
 static bool ytStreamActive = false;
 static HTTPClient ytStreamHttp;
@@ -1490,6 +1501,8 @@ static void handleYTBrowserTouch() {
       if (row >= 0 && row < YT_ROWS && idx < (int)ytItems.size()) {
         // start stream in a separate function below
         ytPlayingTitle = ytItems[idx].title;
+        remoteSourceLabel = "YouTube";
+        remoteReturnScreen = Screen::YT_BROWSER;
         // store selected URL temporarily in query-like global via direct start call
         YTItem chosen = ytItems[idx];
         // close existing stream before opening new one
@@ -1506,7 +1519,6 @@ static void handleYTBrowserTouch() {
           cmd.end();
           if (rc >= 200 && rc < 300) {
             allocateYTFrameBuffer();
-            ytStreamHttp.useHTTP10(true);
             ytStreamHttp.useHTTP10(true);
             ytStreamHttp.setTimeout(10000);
             if (ytStreamHttp.begin(ytServer + "/stream.mjpg")) {
@@ -1530,6 +1542,183 @@ static void handleYTBrowserTouch() {
             }
           } else { ytMessage = "Play HTTP " + String(rc); st.dirty = true; }
         }
+      }
+    }
+  }
+  wasDown = down;
+}
+
+// -----------------------------------------------------------------------------
+// Live TV browser - VTV Go through the PC server
+// -----------------------------------------------------------------------------
+static const int TV_ROWS = 6;
+
+static bool fetchTVList() {
+  if (!ensureYTReady()) return false;
+  drawStatus(tr("TRUYỀN HÌNH", "LIVE TV"), tr("Đang tải danh sách kênh...", "Loading channels..."));
+  HTTPClient http;
+  http.setTimeout(20000);
+  if (!http.begin(ytServer + "/api/tv/channels")) return false;
+  int code = http.GET();
+  if (code != HTTP_CODE_OK) {
+    tvMessage = "Server HTTP " + String(code);
+    http.end();
+    return false;
+  }
+  String payload = http.getString();
+  http.end();
+  JsonDocument doc;
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err || !doc["ok"].as<bool>()) {
+    tvMessage = err ? tr("Lỗi dữ liệu kênh", "Channel data error")
+                    : String((const char *)(doc["error"] | tr("Không tải được kênh", "Could not load channels")));
+    return false;
+  }
+  tvItems.clear();
+  for (JsonObject obj : doc["items"].as<JsonArray>()) {
+    TVItem item;
+    item.id = String((const char *)(obj["id"] | ""));
+    item.name = String((const char *)(obj["name"] | "TV"));
+    if (item.id.length()) tvItems.push_back(item);
+    if (tvItems.size() >= 30) break;
+  }
+  tvScroll = 0;
+  tvMessage = tvItems.empty() ? tr("Không có kênh", "No channels") : "";
+  st.dirty = true;
+  return !tvItems.empty();
+}
+
+static void drawTVBrowser() {
+  ui().fillScreen(TFT_BLACK);
+  drawHeader(tr("TRUYỀN HÌNH", "LIVE TV"), true, "VTV Go");
+  if (!ytServer.length()) {
+    ui().setDatum(MC_DATUM);
+    ui().setTextColor(TFT_YELLOW, TFT_BLACK);
+    ui().text(tr("Chưa có máy chủ", "No server"), 160, 105, 3);
+    ui().setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    ui().text(tr("Chạm để kết nối", "Tap to connect"), 160, 140, 2);
+    st.dirty = false;
+    return;
+  }
+  if (tvItems.empty()) {
+    ui().setDatum(MC_DATUM);
+    ui().setTextColor(TFT_YELLOW, TFT_BLACK);
+    ui().text(tvMessage.length() ? tvMessage : tr("Đang tải...", "Loading..."), 160, 110, 3);
+    st.dirty = false;
+    return;
+  }
+  ui().setDatum(TL_DATUM);
+  for (int row = 0; row < TV_ROWS; ++row) {
+    int idx = tvScroll + row;
+    if (idx >= (int)tvItems.size()) break;
+    int y = 42 + row * 29;
+    uint16_t card = ui().color565(18, 22, 28);
+    ui().fillRounded(8, y, 304, 25, 5, card);
+    ui().setTextColor(TFT_WHITE, card);
+    ui().text(tvItems[idx].name, 18, y + 4, 2);
+    ui().setDatum(MR_DATUM);
+    ui().setTextColor(TFT_RED, card);
+    ui().text("LIVE", 302, y + 12, 1);
+    ui().setDatum(TL_DATUM);
+  }
+  ui().setDatum(BR_DATUM);
+  ui().setTextColor(TFT_DARKGREY, TFT_BLACK);
+  ui().text(String(tvScroll + 1) + "-" + String(min(tvScroll + TV_ROWS, (int)tvItems.size())) + "/" + String(tvItems.size()), 316, 238, 1);
+  st.dirty = false;
+}
+
+static bool startTVChannel(const TVItem &item) {
+  if (!ensureYTReady()) return false;
+  if (ytStreamActive) { ytStreamHttp.end(); ytStreamActive = false; }
+  drawStatus(tr("ĐANG MỞ KÊNH", "OPENING CHANNEL"), item.name);
+
+  HTTPClient cmd;
+  cmd.setTimeout(35000);
+  if (!cmd.begin(ytServer + "/api/tv/play")) return false;
+  cmd.addHeader("Content-Type", "application/json");
+  JsonDocument req;
+  req["id"] = item.id;
+  String body;
+  serializeJson(req, body);
+  int rc = cmd.POST(body);
+  String response = cmd.getString();
+  cmd.end();
+  if (rc < 200 || rc >= 300) {
+    tvMessage = "TV HTTP " + String(rc);
+    if (response.length()) {
+      JsonDocument errDoc;
+      if (!deserializeJson(errDoc, response)) tvMessage = String((const char *)(errDoc["error"] | tvMessage.c_str()));
+    }
+    st.dirty = true;
+    return false;
+  }
+
+  allocateYTFrameBuffer();
+  ytStreamHttp.useHTTP10(true);
+  ytStreamHttp.setTimeout(10000);
+  if (!ytStreamHttp.begin(ytServer + "/stream.mjpg")) return false;
+  int sc = ytStreamHttp.GET();
+  if (sc != HTTP_CODE_OK) {
+    ytStreamHttp.end();
+    tvMessage = "Stream HTTP " + String(sc);
+    st.dirty = true;
+    return false;
+  }
+
+  ytPlayingTitle = item.name;
+  remoteSourceLabel = "VTV Go";
+  remoteReturnScreen = Screen::TV_BROWSER;
+  ytStreamClient = ytStreamHttp.getStreamPtr();
+  ytStreamActive = true;
+  ytParserInJpeg = false;
+  ytParserPrev = -1;
+  ytParserN = 0;
+  ytParserLastByteMs = millis();
+  ytStatsStartMs = millis();
+  ytFramesRx = ytFramesDecoded = ytFramesDropped = 0;
+  ytJpegBytes = ytDecodeUs = ytRenderUs = 0;
+  st.screen = Screen::YT_PLAYER;
+  st.osdVisible = true;
+  st.osdShownMs = millis();
+  ytOsdDirty = true;
+  ui().fillScreen(TFT_BLACK);
+  return true;
+}
+
+static void enterLiveTV() {
+  st.screen = Screen::TV_BROWSER;
+  st.dirty = true;
+  if (!ensureYTReady()) return;
+  if (tvItems.empty()) fetchTVList();
+}
+
+static void handleTVBrowserTouch() {
+  static bool wasDown = false;
+  static int downX = 0, downY = 0, lastX = 0, lastY = 0;
+  int x, y;
+  bool down = readTouch(x, y);
+  if (down && !wasDown) { downX = lastX = x; downY = lastY = y; }
+  if (down) { lastX = x; lastY = y; }
+  if (!down && wasDown) {
+    int dy = lastY - downY;
+    int dx = lastX - downX;
+    if (abs(dy) > 24 && abs(dy) > abs(dx)) {
+      int step = abs(dy) > 90 ? 3 : 1;
+      if (dy < 0) tvScroll = min(tvScroll + step, max(0, (int)tvItems.size() - TV_ROWS));
+      else tvScroll = max(0, tvScroll - step);
+      st.dirty = true;
+    } else if (downY < 34 && downX < 70) {
+      st.screen = Screen::HOME;
+      st.dirty = true;
+    } else if (!ytServer.length()) {
+      ytServer = "";
+      if (ensureYTReady()) fetchTVList();
+      st.dirty = true;
+    } else {
+      int row = (downY - 42) / 29;
+      int idx = tvScroll + row;
+      if (row >= 0 && row < TV_ROWS && idx < (int)tvItems.size()) {
+        startTVChannel(tvItems[idx]);
       }
     }
   }
@@ -1774,7 +1963,7 @@ static void stopYTStream() {
   ytParserPrev = -1;
   ytParserN = 0;
   ytParserLastByteMs = 0;
-  st.screen = Screen::YT_BROWSER;
+  st.screen = remoteReturnScreen;
   st.dirty = true;
 }
 
@@ -1791,7 +1980,7 @@ static void drawYTOSD() {
   ui().fillRect(0, YT_OSD_BOTTOM_Y, 320, 24, TFT_BLACK);
   ui().setDatum(MC_DATUM);
   ui().setTextColor(TFT_YELLOW, TFT_BLACK);
-  ui().text("YouTube", 160, 228, 2);
+  ui().text(remoteSourceLabel, 160, 228, 2);
 }
 
 static void clearYTOSD() {
@@ -1849,7 +2038,6 @@ static void drawHome() {
   const uint16_t bg = ui().color565(5, 7, 11);
   ui().fillScreen(bg);
 
-  // Language selector is always visible on the home screen.
   const uint16_t viBg = uiLanguage == UiLanguage::VI ? ui().color565(0, 105, 150) : ui().color565(28, 31, 37);
   const uint16_t enBg = uiLanguage == UiLanguage::EN ? ui().color565(0, 105, 150) : ui().color565(28, 31, 37);
   ui().fillRounded(184, 3, 76, 22, 5, viBg);
@@ -1861,23 +2049,27 @@ static void drawHome() {
   ui().text("ENGLISH", 290, 14, 1);
 
   ui().setTextColor(TFT_WHITE, bg);
-  ui().text(tr("MINI TIVI", "MINI TV"), 160, 39, 3);
+  ui().text(tr("MINI TIVI", "MINI TV"), 160, 38, 3);
   ui().setTextColor(TFT_LIGHTGREY, bg);
-  ui().text(tr("Trần Đăng Khoa", "Tran Dang Khoa"), 160, 62, 2);
+  ui().text(tr("Trần Đăng Khoa", "Tran Dang Khoa"), 160, 59, 2);
 
-  ui().fillRounded(18, 78, 284, 60, 10, ui().color565(22, 26, 34));
-  ui().fillRounded(18, 150, 284, 60, 10, ui().color565(134, 0, 0));
-  ui().setTextColor(TFT_CYAN, ui().color565(22, 26, 34));
-  ui().text(tr("VIDEO THẺ SD", "SD VIDEO"), 160, 102, 3);
-  ui().setTextColor(TFT_LIGHTGREY, ui().color565(22, 26, 34));
-  ui().text(sdReady ? tr("MJPEG + MP3 sẵn sàng", "MJPEG + MP3 ready")
-                    : tr("Không có SD - vẫn vào được", "No SD - menu still available"), 160, 126, 1);
-  ui().setTextColor(TFT_WHITE, ui().color565(134, 0, 0));
-  ui().text("YOUTUBE TV", 160, 174, 3);
-  ui().text(tr("Vuốt / Tìm kiếm / Chạm để phát", "Swipe / Search / Tap to play"), 160, 199, 1);
+  const uint16_t sdCard = ui().color565(22, 26, 34);
+  const uint16_t ytCard = ui().color565(134, 0, 0);
+  const uint16_t tvCard = ui().color565(16, 63, 48);
+  ui().fillRounded(18, 72, 284, 44, 9, sdCard);
+  ui().fillRounded(18, 124, 284, 44, 9, ytCard);
+  ui().fillRounded(18, 176, 284, 44, 9, tvCard);
+
+  ui().setTextColor(TFT_CYAN, sdCard);
+  ui().text(tr("VIDEO THẺ SD", "SD VIDEO"), 160, 94, 2);
+  ui().setTextColor(TFT_WHITE, ytCard);
+  ui().text("YOUTUBE", 160, 146, 2);
+  ui().setTextColor(TFT_WHITE, tvCard);
+  ui().text(tr("TRUYỀN HÌNH", "LIVE TV"), 160, 198, 2);
+
   ui().setTextColor(WiFi.status() == WL_CONNECTED ? TFT_GREEN : TFT_DARKGREY, bg);
-  ui().text(WiFi.status() == WL_CONNECTED ? ("WiFi " + WiFi.localIP().toString())
-                                          : tr("Thiết lập WiFi khi vào YouTube", "WiFi setup when opening YouTube"), 160, 228, 1);
+  ui().text(WiFi.status() == WL_CONNECTED ? ("WiFi  " + WiFi.localIP().toString())
+                                          : tr("WiFi chưa kết nối", "WiFi not connected"), 160, 232, 1);
   st.dirty = false;
 }
 
@@ -1894,8 +2086,14 @@ static void handleHomeTouch() {
       if (x < 262) setLanguage(UiLanguage::VI);
       else setLanguage(UiLanguage::EN);
       st.dirty = true;
-    } else if (y >= 70 && y < 145) { st.screen = Screen::SD_BROWSER; st.dirty = true; }
-    else if (y >= 145 && y < 220) enterYouTube();
+    } else if (y >= 68 && y < 120) {
+      st.screen = Screen::SD_BROWSER;
+      st.dirty = true;
+    } else if (y >= 120 && y < 172) {
+      enterYouTube();
+    } else if (y >= 172 && y < 226) {
+      enterLiveTV();
+    }
   }
   wasDown = down;
 }
@@ -1997,6 +2195,12 @@ void loop() {
     case Screen::YT_BROWSER:
       if (st.dirty) drawYTBrowser();
       handleYTBrowserTouch();
+      delay(8);
+      break;
+
+    case Screen::TV_BROWSER:
+      if (st.dirty) drawTVBrowser();
+      handleTVBrowserTouch();
       delay(8);
       break;
 

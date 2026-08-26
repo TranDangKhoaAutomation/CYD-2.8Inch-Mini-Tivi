@@ -50,7 +50,89 @@ state: dict[str, Any] = {
     "running": False,
     "error": "",
     "started_at": 0.0,
+    "source_kind": "youtube",
+    "channel_id": "",
 }
+
+VTVGO_CHANNELS = [
+    {"id": "vtv1", "name": "VTV1", "url": "https://vtvgo.vn/channel/vtv1-1,1.html"},
+    {"id": "vtv2", "name": "VTV2", "url": "https://vtvgo.vn/channel/vtv2-1,2.html"},
+    {"id": "vtv3", "name": "VTV3", "url": "https://vtvgo.vn/channel/vtv3-1,3.html"},
+    {"id": "vtv4", "name": "VTV4", "url": "https://vtvgo.vn/channel/vtv4-1,4.html"},
+    {"id": "vtv5", "name": "VTV5", "url": "https://vtvgo.vn/channel/vtv5-1,5.html"},
+    {"id": "vtv6", "name": "VTV6", "url": "https://vtvgo.vn/channel/vtv6-1,13.html"},
+    {"id": "vtv7", "name": "VTV7", "url": "https://vtvgo.vn/channel/vtv7-1,27.html"},
+    {"id": "vtv8", "name": "VTV8", "url": "https://vtvgo.vn/channel/vtv8-1,36.html"},
+    {"id": "vtv9", "name": "VTV9", "url": "https://vtvgo.vn/channel/vtv9-1,39.html"},
+    {"id": "vtv10", "name": "VTV10", "url": "https://vtvgo.vn/channel/vtv10-1,6.html"},
+    {"id": "vietnamtoday", "name": "Vietnam Today", "url": "https://vtvgo.vn/channel/vietnam-today-1,vietnamtoday.html"},
+    {"id": "antv", "name": "ANTV", "url": "https://vtvgo.vn/channel/truyen-hinh-cong-an-nhan-dan-1,89.html"},
+    {"id": "qpvn", "name": "QPVN", "url": "https://vtvgo.vn/channel/truyen-hinh-quoc-phong-viet-nam-1,103.html"},
+    {"id": "hanoi1", "name": "Hà Nội 1", "url": "https://vtvgo.vn/channel/truyen-hinh-ha-noi-1-1,111.html"},
+    {"id": "hanoi2", "name": "Hà Nội 2", "url": "https://vtvgo.vn/channel/truyen-hinh-ha-noi-2-1,17.html"},
+]
+
+
+def _find_vtvgo_channel(channel_id: str) -> dict[str, str]:
+    for item in VTVGO_CHANNELS:
+        if item["id"] == channel_id:
+            return item
+    raise KeyError(f"unknown TV channel: {channel_id}")
+
+
+def _system_chrome_path() -> str:
+    candidates = [
+        Path(r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+        Path(r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe"),
+        Path(r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"),
+        Path(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"),
+    ]
+    for path in candidates:
+        if path.exists():
+            return str(path)
+    raise RuntimeError("Chrome/Edge not found for VTV Go source resolver")
+
+
+def resolve_vtvgo_source(channel: dict[str, str]) -> str:
+    """Use the public VTV Go web player to obtain its current non-DRM HLS URL."""
+    from playwright.sync_api import sync_playwright
+
+    found: list[str] = []
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(
+            headless=True,
+            executable_path=_system_chrome_path(),
+            args=["--autoplay-policy=no-user-gesture-required", "--disable-blink-features=AutomationControlled"],
+        )
+        try:
+            page = browser.new_page(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36",
+                locale="vi-VN",
+                viewport={"width": 1280, "height": 720},
+            )
+
+            def on_request(req) -> None:
+                url = req.url
+                low = url.lower()
+                if "vtvgolive-" in low and "/hls/" in low and low.endswith("master.m3u8"):
+                    if url not in found:
+                        found.append(url)
+
+            page.on("request", on_request)
+            page.goto(channel["url"], wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(1000)
+            consent = page.get_by_role("button", name="Đồng ý và tiếp tục")
+            if consent.count():
+                consent.click()
+            deadline = time.monotonic() + 14.0
+            while time.monotonic() < deadline and not found:
+                page.wait_for_timeout(250)
+        finally:
+            browser.close()
+
+    if not found:
+        raise RuntimeError(f"VTV Go did not expose a non-DRM HLS source for {channel['name']}")
+    return found[0]
 
 
 def _format_item(entry: dict[str, Any]) -> VideoItem:
@@ -144,13 +226,17 @@ def choose_video(url: str, title: str = "") -> None:
         state["error"] = ""
         state["running"] = False
         state["started_at"] = 0.0
+        state["source_kind"] = "youtube"
+        state["channel_id"] = ""
 
 
 def resolve_selected() -> tuple[str, str]:
     snap = _state_snapshot()
+    if snap.get("source_kind") == "direct_hls" and snap.get("source_url"):
+        return str(snap["source_url"]), str(snap.get("title") or "Live TV")
     selected = snap.get("selected")
     if not selected:
-        raise RuntimeError("No YouTube video selected")
+        raise RuntimeError("No video selected")
     direct, title = resolve_direct_media(str(selected))
     with state_lock:
         state["source_url"] = direct
@@ -252,8 +338,10 @@ def mjpeg_generator():
 
         # Build a few seconds of reserve before the first frame is emitted. Without -re,
         # ffmpeg can continue filling the deeper queue in the background while playback runs.
+        snap = _state_snapshot()
+        prebuffer_target = 12 if snap.get("source_kind") == "direct_hls" else YT_PREBUFFER_FRAMES
         prebuffer_started = time.monotonic()
-        while frame_queue.qsize() < YT_PREBUFFER_FRAMES and producer.is_alive():
+        while frame_queue.qsize() < prebuffer_target and producer.is_alive():
             if time.monotonic() - prebuffer_started > 12.0:
                 break
             time.sleep(0.05)
@@ -359,6 +447,35 @@ def api_play():
         return jsonify({"ok": False, "error": "missing url"}), 400
     choose_video(url, title)
     return jsonify({"ok": True, "stream": "/stream.mjpg"})
+
+
+@app.get("/api/tv/channels")
+def api_tv_channels():
+    return jsonify({"ok": True, "items": VTVGO_CHANNELS})
+
+
+@app.post("/api/tv/play")
+def api_tv_play():
+    data = request.get_json(silent=True) or {}
+    channel_id = str(data.get("id") or "").strip().lower()
+    try:
+        channel = _find_vtvgo_channel(channel_id)
+        direct = resolve_vtvgo_source(channel)
+    except KeyError as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 404
+    except Exception as exc:
+        _set_error(str(exc))
+        return jsonify({"ok": False, "error": str(exc)}), 502
+    with state_lock:
+        state["selected"] = channel["url"]
+        state["source_url"] = direct
+        state["title"] = channel["name"]
+        state["source_kind"] = "direct_hls"
+        state["channel_id"] = channel_id
+        state["error"] = ""
+        state["running"] = False
+        state["started_at"] = 0.0
+    return jsonify({"ok": True, "stream": "/stream.mjpg", "title": channel["name"]})
 
 
 @app.get("/api/feed")
