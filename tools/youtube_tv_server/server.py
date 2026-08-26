@@ -17,7 +17,7 @@ from PIL import Image
 from yt_dlp import YoutubeDL
 
 HOST = "0.0.0.0"
-PORT = int(os.environ.get("CYD_TV_PORT", "8765"))
+PORT = int(os.environ.get("CYD_TV_PORT", "8876"))
 DISCOVERY_PORT = 4210
 DISCOVERY_MAGIC = b"CYD_TV_DISCOVER"
 BASE_DIR = Path(__file__).resolve().parent

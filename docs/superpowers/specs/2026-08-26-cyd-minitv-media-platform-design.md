@@ -17,7 +17,7 @@ Build a complete ESP32-2432S028R MiniTV firmware that keeps the now-verified cor
 ### 1. Display and touch foundation
 Replace TFT_eSPI rendering in the main MiniTV firmware with the proven Arduino_GFX display path. Keep all application screens and interaction states, but route drawing through a small display abstraction so video and UI use one consistent color pipeline.
 
-Replace the current hand-bit-banged XPT2046 reader with `XPT2046_Touchscreen`. Run touch in rotation 1 and add a four-point calibration flow. Store calibration bounds and axis orientation in NVS/Preferences. On first boot without valid calibration, show four crosshairs; later boots load calibration automatically. A UART `touchcal` command restarts calibration.
+Use the XPT2046 on its dedicated physical pins with an isolated software-SPI transport because the ESP32 classic has only two user SPI hosts: HSPI is reserved for TFT and VSPI for SD. Replace the current ad-hoc mapping with a filtered touch module and a four-point calibration flow in landscape rotation 1. Store calibration bounds and axis orientation in NVS/Preferences. On first boot without valid calibration, show four crosshairs; later boots load calibration automatically. A UART `touchcal` command restarts calibration.
 
 ### 2. SD media player
 Keep the existing `/videos/<base>.mjpeg + .idx` long-video format. Continue reading `.idx` offsets directly from SD so long files do not allocate the entire index in RAM.

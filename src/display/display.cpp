@@ -9,7 +9,8 @@ constexpr int TFT_MISO_PIN = 12;
 constexpr int TFT_BL_PIN = 21;
 constexpr int32_t TFT_SPI_HZ = 40000000;
 
-Arduino_DataBus *bus = new Arduino_HWSPI(TFT_DC_PIN, TFT_CS_PIN, TFT_SCK_PIN, TFT_MOSI_PIN, TFT_MISO_PIN);
+SPIClass tftSpi(HSPI);
+Arduino_DataBus *bus = new Arduino_HWSPI(TFT_DC_PIN, TFT_CS_PIN, TFT_SCK_PIN, TFT_MOSI_PIN, TFT_MISO_PIN, &tftSpi, true);
 Arduino_GFX *gfx = new Arduino_ILI9341(bus);
 }
 

@@ -91,6 +91,17 @@ static uint32_t ytParserLastByteMs = 0;
 static uint32_t touchDebugUntil = 0;
 static uint32_t touchLastLogMs = 0;
 
+static constexpr uint32_t TOUCH_CAL_MAGIC = 0x43594454u; // "CYDT"
+struct TouchCalibration {
+  uint32_t magic = 0;
+  uint16_t rawLeft = TOUCH_Y_MIN;
+  uint16_t rawRight = TOUCH_Y_MAX;
+  uint16_t rawTop = TOUCH_X_MAX;
+  uint16_t rawBottom = TOUCH_X_MIN;
+};
+static TouchCalibration touchCal;
+static bool touchCalibrated = false;
+
 // JPEG byte-order diagnostic matrix:
 // A=BIG/swap0, B=BIG/swap1, C=LITTLE/swap0, D=LITTLE/swap1.
 // D is the default because JPEGDEC native RGB565 + legacy display stack byte swap is the
@@ -186,30 +197,193 @@ static uint16_t touchRead12(uint8_t cmd) {
   return (raw >> 3) & 0x0FFF;
 }
 
-static bool readTouch(int &x, int &y) {
-  // IRQ is active LOW on XPT2046. It is a real hardware indication and avoids
-  // mistaking idle ADC values for touches.
+static bool readTouchRaw(int &rawX, int &rawY) {
   if (digitalRead(TOUCH_IRQ) != LOW) return false;
-
-  // Median-of-3 style averaging reduces resistive touch jitter.
   uint32_t sx = 0, sy = 0;
-  for (int i = 0; i < 3; ++i) {
-    sy += touchRead12(0x90); // raw Y
-    sx += touchRead12(0xD0); // raw X
+  constexpr int samples = 5;
+  for (int i = 0; i < samples; ++i) {
+    sy += touchRead12(0x90);
+    sx += touchRead12(0xD0);
   }
-  int rawX = (int)(sx / 3);
-  int rawY = (int)(sy / 3);
-  if (rawX < 50 || rawY < 50) return false;
+  rawX = (int)(sx / samples);
+  rawY = (int)(sy / samples);
+  return rawX >= 50 && rawY >= 50 && rawX <= 4095 && rawY <= 4095;
+}
 
-  x = map(rawY, TOUCH_Y_MIN, TOUCH_Y_MAX, 0, ui().width());
-  y = map(rawX, TOUCH_X_MIN, TOUCH_X_MAX, ui().height(), 0);
+static bool touchCalibrationSane(const TouchCalibration &c) {
+  if (c.magic != TOUCH_CAL_MAGIC) return false;
+  if (c.rawLeft < 40 || c.rawLeft > 4055 || c.rawRight < 40 || c.rawRight > 4055 ||
+      c.rawTop < 40 || c.rawTop > 4055 || c.rawBottom < 40 || c.rawBottom > 4055) return false;
+  if (abs((int)c.rawRight - (int)c.rawLeft) < 1000) return false;
+  if (abs((int)c.rawBottom - (int)c.rawTop) < 1000) return false;
+  return true;
+}
+
+static bool loadTouchCalibration() {
+  Preferences prefs;
+  if (!prefs.begin("cydtouch", true)) return false;
+  TouchCalibration c;
+  c.magic = prefs.getUInt("magic", 0);
+  c.rawLeft = prefs.getUShort("left", 0);
+  c.rawRight = prefs.getUShort("right", 0);
+  c.rawTop = prefs.getUShort("top", 0);
+  c.rawBottom = prefs.getUShort("bottom", 0);
+  prefs.end();
+  if (!touchCalibrationSane(c)) return false;
+  touchCal = c;
+  touchCalibrated = true;
+  Serial.printf("[TOUCHCAL] loaded L=%u R=%u T=%u B=%u\n",
+                touchCal.rawLeft, touchCal.rawRight, touchCal.rawTop, touchCal.rawBottom);
+  return true;
+}
+
+static void saveTouchCalibration() {
+  Preferences prefs;
+  if (!prefs.begin("cydtouch", false)) return;
+  prefs.putUInt("magic", TOUCH_CAL_MAGIC);
+  prefs.putUShort("left", touchCal.rawLeft);
+  prefs.putUShort("right", touchCal.rawRight);
+  prefs.putUShort("top", touchCal.rawTop);
+  prefs.putUShort("bottom", touchCal.rawBottom);
+  prefs.end();
+}
+
+static void clearTouchCalibration() {
+  Preferences prefs;
+  if (prefs.begin("cydtouch", false)) {
+    prefs.clear();
+    prefs.end();
+  }
+  touchCalibrated = false;
+}
+
+static void mapTouchRawToScreen(int rawX, int rawY, int &x, int &y) {
+  x = (int)map(rawY, touchCal.rawLeft, touchCal.rawRight, 20, 299);
+  y = (int)map(rawX, touchCal.rawTop, touchCal.rawBottom, 20, 219);
+  x = constrain(x, 0, ui().width() - 1);
+  y = constrain(y, 0, ui().height() - 1);
+}
+
+static bool readTouch(int &x, int &y) {
+  int rawX = 0, rawY = 0;
+  if (!readTouchRaw(rawX, rawY)) return false;
+  if (!touchCalibrated) {
+    x = map(rawY, TOUCH_Y_MIN, TOUCH_Y_MAX, 0, ui().width() - 1);
+    y = map(rawX, TOUCH_X_MIN, TOUCH_X_MAX, ui().height() - 1, 0);
+  } else {
+    mapTouchRawToScreen(rawX, rawY, x, y);
+  }
   x = constrain(x, 0, ui().width() - 1);
   y = constrain(y, 0, ui().height() - 1);
   if ((int32_t)(touchDebugUntil - millis()) > 0 && millis() - touchLastLogMs >= 80) {
     touchLastLogMs = millis();
-    Serial.printf("[TOUCH] rawX=%d rawY=%d x=%d y=%d irq=%d\n", rawX, rawY, x, y, digitalRead(TOUCH_IRQ));
+    Serial.printf("[TOUCH] rawX=%d rawY=%d x=%d y=%d irq=%d cal=%d\n",
+                  rawX, rawY, x, y, digitalRead(TOUCH_IRQ), touchCalibrated ? 1 : 0);
   }
   return true;
+}
+
+static void drawTouchCalibrationTarget(int x, int y, int index) {
+  ui().fillScreen(TFT_BLACK);
+  ui().setDatum(MC_DATUM);
+  ui().setTextColor(TFT_WHITE, TFT_BLACK);
+  ui().text("HIEU CHUAN CAM UNG", 160, 82, 2);
+  ui().setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  ui().text(String("Cham dung dau +  ") + String(index + 1) + "/4", 160, 105, 1);
+  ui().fillRect(x - 14, y - 1, 29, 3, TFT_YELLOW);
+  ui().fillRect(x - 1, y - 14, 3, 29, TFT_YELLOW);
+  ui().drawRect(x - 6, y - 6, 13, 13, TFT_CYAN);
+}
+
+static bool captureTouchCalibrationRaw(int &rawX, int &rawY) {
+  while (digitalRead(TOUCH_IRQ) == LOW) delay(10);
+  while (digitalRead(TOUCH_IRQ) != LOW) delay(5);
+  delay(35);
+  int xs[9], ys[9];
+  int n = 0;
+  while (n < 9) {
+    int x = 0, y = 0;
+    if (readTouchRaw(x, y)) {
+      xs[n] = x;
+      ys[n] = y;
+      ++n;
+      delay(8);
+    } else if (n < 5) {
+      n = 0;
+      while (digitalRead(TOUCH_IRQ) != LOW) delay(5);
+      delay(25);
+    } else {
+      break;
+    }
+  }
+  while (digitalRead(TOUCH_IRQ) == LOW) delay(10);
+  if (n < 5) return false;
+  for (int i = 0; i < n - 1; ++i) {
+    for (int j = i + 1; j < n; ++j) {
+      if (xs[j] < xs[i]) { int t = xs[i]; xs[i] = xs[j]; xs[j] = t; }
+      if (ys[j] < ys[i]) { int t = ys[i]; ys[i] = ys[j]; ys[j] = t; }
+    }
+  }
+  rawX = xs[n / 2];
+  rawY = ys[n / 2];
+  return true;
+}
+
+static void runTouchCalibration() {
+  const int tx[4] = {20, 299, 299, 20};
+  const int ty[4] = {20, 20, 219, 219};
+  int rx[4], ry[4];
+  while (true) {
+    for (int i = 0; i < 4; ++i) {
+      drawTouchCalibrationTarget(tx[i], ty[i], i);
+      while (!captureTouchCalibrationRaw(rx[i], ry[i])) delay(50);
+      Serial.printf("[TOUCHCAL] p%d target=%d,%d raw=%d,%d\n", i + 1, tx[i], ty[i], rx[i], ry[i]);
+      delay(120);
+    }
+    TouchCalibration c;
+    c.magic = TOUCH_CAL_MAGIC;
+    c.rawLeft = (uint16_t)((ry[0] + ry[3]) / 2);
+    c.rawRight = (uint16_t)((ry[1] + ry[2]) / 2);
+    c.rawTop = (uint16_t)((rx[0] + rx[1]) / 2);
+    c.rawBottom = (uint16_t)((rx[2] + rx[3]) / 2);
+    if (!touchCalibrationSane(c)) {
+      Serial.println("[TOUCHCAL] invalid spans, retrying");
+      ui().fillScreen(TFT_BLACK);
+      ui().setDatum(MC_DATUM);
+      ui().setTextColor(TFT_RED, TFT_BLACK);
+      ui().text("CHAM LAI 4 DIEM", 160, 120, 2);
+      delay(900);
+      continue;
+    }
+    touchCal = c;
+    touchCalibrated = true;
+
+    ui().fillScreen(TFT_BLACK);
+    ui().setDatum(MC_DATUM);
+    ui().setTextColor(TFT_WHITE, TFT_BLACK);
+    ui().text("KIEM TRA TAM MAN HINH", 160, 82, 2);
+    ui().fillRect(146, 119, 29, 3, TFT_YELLOW);
+    ui().fillRect(159, 106, 3, 29, TFT_YELLOW);
+    int crx = 0, cry = 0;
+    if (!captureTouchCalibrationRaw(crx, cry)) continue;
+    int cx = 0, cy = 0;
+    mapTouchRawToScreen(crx, cry, cx, cy);
+    Serial.printf("[TOUCHCAL] center raw=%d,%d mapped=%d,%d\n", crx, cry, cx, cy);
+    if (abs(cx - 160) > 25 || abs(cy - 120) > 25) {
+      Serial.println("[TOUCHCAL] center validation failed, retrying");
+      touchCalibrated = false;
+      continue;
+    }
+    saveTouchCalibration();
+    Serial.printf("[TOUCHCAL] saved L=%u R=%u T=%u B=%u\n",
+                  touchCal.rawLeft, touchCal.rawRight, touchCal.rawTop, touchCal.rawBottom);
+    ui().fillScreen(TFT_BLACK);
+    ui().setTextColor(TFT_GREEN, TFT_BLACK);
+    ui().text("CAM UNG DA CHUAN", 160, 120, 2);
+    delay(700);
+    st.dirty = true;
+    return;
+  }
 }
 
 static void drawHeader(const String &title, bool back, const String &right = "") {
@@ -793,7 +967,7 @@ static bool scanSubnetForServer() {
       ui().setTextColor(TFT_DARKGREY, TFT_BLACK);
       ui().text(String("IP ") + ip.toString(), 160, 170, 2);
     }
-    if (validateServer(ip, 8765, 28)) return true;
+    if (validateServer(ip, 8876, 28)) return true;
     delay(1);
   }
   return false;
@@ -832,7 +1006,7 @@ static bool discoverYTServer() {
 
   Serial.println("[SERVER] UDP discovery failed, trying last-known NVS cache");
   IPAddress cachedIp;
-  uint16_t cachedPort = 8765;
+  uint16_t cachedPort = 8876;
   if (loadServerCache(cachedIp, cachedPort) && validateServer(cachedIp, cachedPort, 120)) {
     Serial.printf("[SERVER] found by NVS cache: %s\n", ytServer.c_str());
     return true;
@@ -964,6 +1138,11 @@ static void handleSerialDebug() {
     } else if (cmd == "touch") {
       touchDebugUntil = millis() + 10000;
       Serial.println("[TOUCH] raw + mapped logging enabled for 10 seconds");
+    } else if (cmd == "touchcal") {
+      Serial.println("[TOUCHCAL] forced recalibration");
+      clearTouchCalibration();
+      runTouchCalibration();
+      st.dirty = true;
     } else if (cmd == "heap") {
       Serial.printf("[HEAP] free=%u largest=%u min=%u\n", ESP.getFreeHeap(), ESP.getMaxAllocHeap(), ESP.getMinFreeHeap());
     } else if (cmd == "fps") {
@@ -1459,6 +1638,10 @@ void setup() {
   pinMode(TOUCH_IRQ, INPUT);
   digitalWrite(TOUCH_CS, HIGH);
   digitalWrite(TOUCH_CLK, LOW);
+  if (!loadTouchCalibration()) {
+    Serial.println("[TOUCHCAL] no valid calibration; starting 4-point calibration");
+    runTouchCalibration();
+  }
 
   // SD owns VSPI exclusively: SCK=18, MISO=19, MOSI=23, CS=5.
   // TFT uses its dedicated HSPI-style pin set through Arduino_GFX; SD remains on VSPI.

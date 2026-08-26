@@ -4,7 +4,7 @@
 
 **Goal:** Replace the unstable TFT_eSPI display/touch path with the verified Arduino_GFX display pipeline and calibrated XPT2046 touch while preserving MiniTV application state/screens.
 
-**Architecture:** Keep the existing MiniTV state machine, but centralize display setup and drawing behind Arduino_GFX. Use `XPT2046_Touchscreen` with rotation 1 and a four-point calibration stored in Preferences. Do not change SD/YouTube behavior beyond the minimum needed to compile and interact.
+**Architecture:** Keep the existing MiniTV state machine, but centralize display setup and drawing behind Arduino_GFX. Use an isolated software-SPI XPT2046 transport with landscape mapping and a four-point calibration stored in Preferences; HSPI is reserved for TFT and VSPI for SD. Do not change SD/YouTube behavior beyond the minimum needed to compile and interact.
 
 **Tech Stack:** PlatformIO, Arduino ESP32 core, Arduino_GFX 1.6.1, JPEGDEC 1.8.2 source/tag, XPT2046_Touchscreen, Preferences/NVS.
 
@@ -252,9 +252,9 @@ from pathlib import Path
 CPP = Path('src/touch/touch.cpp').read_text(encoding='utf-8')
 
 def test_touch_uses_xpt2046_library_and_rotation_one():
-    assert 'XPT2046_Touchscreen' in CPP
-    assert 'ts.setRotation(1)' in CPP
-    assert 'touchRead12' not in CPP
+    assert 'TOUCH_CLK' in CPP and 'TOUCH_MOSI' in CPP and 'TOUCH_MISO' in CPP
+    assert 'touchReadScreen' in CPP
+    assert 'touchRead12' not in Path('src/main.cpp').read_text(encoding='utf-8')
 ```
 
 - [ ] **Step 2: Run and verify failure**
@@ -262,21 +262,15 @@ def test_touch_uses_xpt2046_library_and_rotation_one():
 Run: `python tests/test_touch_stack.py`
 Expected: FAIL.
 
-- [ ] **Step 3: Implement library-based reader**
+- [ ] **Step 3: Implement isolated software-SPI reader**
 
 ```cpp
-static SPIClass touchSpi(VSPI);
-static XPT2046_Touchscreen ts(33, 36);
-
-bool touchBegin() {
-    touchSpi.begin(25, 39, 32, 33);
-    if (!ts.begin(touchSpi)) return false;
-    ts.setRotation(1);
-    return true;
-}
+// XPT2046 uses dedicated pins and software clocking so it cannot remap HSPI/VSPI.
+// touchReadRaw() performs filtered multi-sample 12-bit ADC reads on CLK25/MISO39/MOSI32/CS33.
+// touchReadScreen() applies persisted calibration and landscape orientation.
 ```
 
-Do not share the SD SPI object. If VSPI host contention appears because both devices use VSPI, use software SPI only for touch or create an isolated transaction strategy; preserve the physical touch pins.
+Do not create or remap any hardware SPI host for touch. Preserve physical touch pins and keep touch traffic isolated from TFT/SD buses.
 
 - [ ] **Step 4: Remove bit-bang functions from `main.cpp`**
 
