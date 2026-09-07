@@ -3,5 +3,10 @@
 *.bin
 .superpowers/
 tools/youtube_tv_server/cache/
+tools/youtube_tv_server/server.pid
+tools/youtube_tv_server/server.log
+tools/youtube_tv_server/server-error.log
 __pycache__/
 *.pyc
+diag_audio/
+tests/*.wav

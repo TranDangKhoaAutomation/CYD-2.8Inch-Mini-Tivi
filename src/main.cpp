@@ -4,10 +4,11 @@
 #include <WiFi.h>
 #include <WiFiUdp.h>
 #include <HTTPClient.h>
-#include <WiFiManager.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include "audio_selftest.h"
 #include <JPEGDEC.h>
+#include "Audio.h"
 #include "display/display.h"
 #include "display/ui_draw.h"
 #include "config.h"
@@ -17,14 +18,21 @@
 
 JPEGDEC jpeg;
 SPIClass sdSPI(VSPI);
+// ESP32-2432S028R onboard path: I2S built-in DAC channel 2 -> GPIO26 -> FM8002A -> SPEAK.
 
 static constexpr uint16_t DISCOVERY_SERVER_PORT = 4210;
 static constexpr uint16_t DISCOVERY_LOCAL_PORT  = 4211;
+static constexpr uint16_t YT_SERVER_PORT = 8876;
 static constexpr int YT_ROWS = 3;
 static constexpr int YT_ROW_H = 66;
+static constexpr int YT_THUMB_X = 4;
+static constexpr int YT_THUMB_W = 96;
+static constexpr int YT_THUMB_H = 54;
+static constexpr int YT_TEXT_X = 106;
+static constexpr int YT_TEXT_RIGHT = 316;
 
 struct VideoIndex {
-  float fps = 30.0f;
+  float fps = 40.0f;
   uint32_t frames = 0;
   File idxFile;
   bool valid = false;
@@ -37,6 +45,8 @@ enum class Screen {
   YT_BROWSER,
   YT_KEYBOARD,
   TV_BROWSER,
+  WIFI_LIST,
+  WIFI_PASSWORD,
   YT_PLAYER
 };
 
@@ -114,6 +124,31 @@ static String ytPlayingTitle;
 static String remoteSourceLabel = "YouTube";
 static Screen remoteReturnScreen = Screen::YT_BROWSER;
 static String tvMessage;
+
+struct WiFiUiEntry {
+  String ssid;
+  int32_t rssi = -127;
+  wifi_auth_mode_t encryption = WIFI_AUTH_OPEN;
+};
+static std::vector<WiFiUiEntry> wifiEntries;
+static int wifiScroll = 0;
+static String wifiSelectedSsid;
+static String wifiPassword;
+static String wifiMessage;
+static bool wifiPasswordVisible = false;
+static bool wifiKeyboardUpper = false;
+static bool wifiKeyboardSymbols = false;
+static Screen wifiReturnScreen = Screen::HOME;
+static constexpr int WIFI_ROWS = 6;
+static constexpr char WIFI_KB_DIGITS[] = "1234567890";
+static constexpr char WIFI_KB_ALPHA1[] = "QWERTYUIOP";
+static constexpr char WIFI_KB_ALPHA2[] = "ASDFGHJKL-";
+static constexpr char WIFI_KB_ALPHA3[] = "ZXCVBNM_.";
+static constexpr const char *WIFI_KB_SYMBOLS[] = {
+  "!@#$%^&*()",
+  "-_=+[]{};:",
+  ".,?/\\|~`'\""
+};
 static bool ytFeedLoading = false;
 static bool ytStreamActive = false;
 static HTTPClient ytStreamHttp;
@@ -125,6 +160,22 @@ static bool ytParserInJpeg = false;
 static int ytParserPrev = -1;
 static size_t ytParserN = 0;
 static uint32_t ytParserLastByteMs = 0;
+static uint32_t ytLastFrameMs = 0;
+static uint32_t ytVideoOpenedMs = 0;
+static uint32_t ytLastVideoReconnectMs = 0;
+static bool ytAwaitingFirstFrame = true;
+static constexpr uint32_t YT_VIDEO_START_GRACE_MS = 18000;
+static constexpr uint32_t YT_VIDEO_STALL_MS = 22000;
+static constexpr uint32_t LIVE_VIDEO_STALL_MS = 8000;
+static constexpr uint32_t YT_VIDEO_RECONNECT_COOLDOWN_MS = 3000;
+
+static void armYTVideoWatchdog() {
+  const uint32_t now = millis();
+  ytVideoOpenedMs = now;
+  ytLastFrameMs = now;
+  ytParserLastByteMs = now;
+  ytAwaitingFirstFrame = true;
+}
 
 static constexpr int YT_FRAME_W = 320;
 static constexpr int YT_FRAME_H = 180;
@@ -132,10 +183,11 @@ static constexpr int YT_VIDEO_Y = 30;
 static constexpr int YT_VIDEO_H = 180;
 static constexpr int YT_OSD_TOP_H = 28;
 static constexpr int YT_OSD_BOTTOM_Y = 216;
-static constexpr int YT_FRAME_PARTS = 2;
-static constexpr int YT_FRAME_PART_H = 90;
+static constexpr int YT_FRAME_PARTS = 4;
+static constexpr int YT_FRAME_PART_H = 45;
+static_assert(YT_FRAME_PARTS * YT_FRAME_PART_H == YT_FRAME_H, "YT frame split must cover 180 rows");
 static constexpr size_t YT_JPEG_INITIAL_BUF = 16 * 1024;
-static uint16_t *ytFramePart[YT_FRAME_PARTS] = {nullptr, nullptr};
+static uint16_t *ytFramePart[YT_FRAME_PARTS] = {};
 static bool ytFrameBufferEnabled = false;
 static bool ytOsdDirty = true;
 
@@ -169,6 +221,116 @@ static uint32_t ytFramesRx = 0, ytFramesDecoded = 0, ytFramesDropped = 0;
 static uint64_t ytJpegBytes = 0, ytDecodeUs = 0, ytRenderUs = 0;
 static bool ytDecodeInProgress = false;
 
+// Audio architecture proven in D:\CYD-MiniTV-forward:
+// ESP32-audioI2S decodes MP3 on a dedicated core-0 task and feeds internal DAC2/GPIO26.
+// Keeping decode/I2S off Arduino loop prevents audio stalls from freezing MJPEG rendering.
+alignas(Audio) static uint8_t audioStorage[sizeof(Audio)];
+static Audio *audio = nullptr;
+static TaskHandle_t audioTaskHandle = nullptr;
+static SemaphoreHandle_t audioMutex = nullptr;
+static bool remoteAudioActive = false;
+static volatile bool audioDecoderReady = false;
+static constexpr uint32_t AUDIO_HEALTH_MS = 1000;
+static constexpr uint32_t AUDIO_RETRY_MS = 2000;
+static constexpr uint32_t AUDIO_EMPTY_RESTART_MS = 10000;
+static uint32_t audioLastHealthMs = 0;
+static uint32_t audioLastRetryMs = 0;
+static uint32_t audioStartedMs = 0;
+static uint32_t audioBufferEmptySinceMs = 0;
+static uint32_t audioLastHealthLogMs = 0;
+static volatile bool audioFadePending = false;
+static uint8_t audioAppliedVolume = 0;
+static uint32_t audioLastFadeMs = 0;
+static constexpr uint32_t AUDIO_FADE_STEP_MS = 24;
+static constexpr uint8_t AUDIO_FADE_STEP = 2;
+
+// ESP32-audioI2S diagnostic callback. This is intentionally lightweight and
+// reports connection/codec/sync/slow-stream events from the decoder task.
+void audio_info(const char *info) {
+  if (!info || !*info) return;
+  if (strstr(info, "MP3Decoder has been initialized") != nullptr) {
+    audioDecoderReady = true;
+    audioFadePending = true;
+  }
+  Serial.printf("[AUDIOI2S] %s\n", info);
+}
+
+// The ESP32 internal DAC only consumes the high 8 bits of each signed 16-bit
+// sample. First-order error feedback preserves low-level speech resolution. A
+// very small triangular dither perturbs only the quantizer decision so periodic
+// DAC-code limit cycles become noise-like instead of an audible buzz/rasp.
+static constexpr int32_t DAC_DITHER_AMPLITUDE = 32; // 1/8 of one DAC LSB
+static int32_t dacQuantErrorLeft = 0;
+static int32_t dacQuantErrorRight = 0;
+static uint32_t dacDitherStateLeft = 0x6D2B79F5u;
+static uint32_t dacDitherStateRight = 0xA341316Cu;
+
+// ESP32-audioI2S halves every decoded PCM sample before its volume stage to keep
+// 6 dB of EQ headroom. This firmware does not enable those EQ filters, so reclaim
+// that headroom for the tiny onboard FM8002A/speaker. Saturation prevents wraparound.
+static int16_t boostInternalDacSample(int16_t sample) {
+  int32_t boosted = (int32_t)sample * 2;
+  if (boosted > 32767) boosted = 32767;
+  if (boosted < -32768) boosted = -32768;
+  return (int16_t)boosted;
+}
+
+static uint32_t nextDacDitherRandom(uint32_t &state) {
+  state ^= state << 13;
+  state ^= state >> 17;
+  state ^= state << 5;
+  return state;
+}
+
+static int16_t quantizeForInternalDac8(int16_t sample, int32_t &error, uint32_t &rng) {
+  int32_t base = (int32_t)sample + error;
+  if (base > 32767) base = 32767;
+  if (base < -32768) base = -32768;
+
+  const int32_t r1 = (int32_t)((nextDacDitherRandom(rng) >> 24) & 0xFFu);
+  const int32_t r2 = (int32_t)((nextDacDitherRandom(rng) >> 24) & 0xFFu);
+  const int32_t dither = ((r1 - r2) * DAC_DITHER_AMPLITUDE) / 255;
+  int32_t decision = base + dither;
+  if (decision > 32767) decision = 32767;
+  if (decision < -32768) decision = -32768;
+
+  int32_t q;
+  if (decision >= 0) q = ((decision + 128) >> 8) << 8;
+  else q = -((((-decision) + 128) >> 8) << 8);
+  if (q > 32512) q = 32512;
+  if (q < -32768) q = -32768;
+
+  error = base - q;
+  if (error > 127) error = 127;
+  if (error < -128) error = -128;
+  return (int16_t)q;
+}
+
+void audio_process_i2s(uint32_t *sample, bool *continueI2S) {
+  if (!continueI2S) return;
+  *continueI2S = true;
+  if (!sample || USE_EXTERNAL_I2S_DAC) return;
+
+  int16_t left = (int16_t)((*sample >> 16) & 0xFFFFu);
+  int16_t right = (int16_t)(*sample & 0xFFFFu);
+  left = boostInternalDacSample(left);
+  right = boostInternalDacSample(right);
+  left = quantizeForInternalDac8(left, dacQuantErrorLeft, dacDitherStateLeft);
+  right = quantizeForInternalDac8(right, dacQuantErrorRight, dacDitherStateRight);
+  *sample = ((uint32_t)(uint16_t)left << 16) | (uint16_t)right;
+}
+
+// Debounced BOOT/GPIO0 runtime volume control. An initial held BOOT is ignored until release
+// so a manual flash/download sequence cannot accidentally change the user's volume.
+static bool bootRawDown = false;
+static bool bootStableDown = false;
+static bool bootIgnoreUntilRelease = false;
+static uint32_t bootRawChangedMs = 0;
+static uint32_t bootPressedMs = 0;
+static bool volumePopupVisible = false;
+static uint32_t volumePopupShownMs = 0;
+static constexpr uint32_t VOLUME_POPUP_MS = 1200;
+
 static bool ensureBuf(size_t n) {
   if (n <= frameBufSize) return true;
   uint8_t *nb = (uint8_t *)realloc(frameBuf, n);
@@ -186,6 +348,302 @@ static void setBrightness(uint8_t v) {
 static void showOsd() {
   st.osdVisible = true;
   st.osdShownMs = millis();
+}
+
+static void audioTask(void *) {
+  for (;;) {
+    if (audio && audioMutex && xSemaphoreTake(audioMutex, portMAX_DELAY) == pdTRUE) {
+      audio->loop();
+      xSemaphoreGive(audioMutex);
+    }
+    vTaskDelay(1);
+  }
+}
+
+static void audioCmd(const std::function<void()> &fn) {
+  if (!audio || !audioMutex) return;
+  if (xSemaphoreTake(audioMutex, pdMS_TO_TICKS(500)) == pdTRUE) {
+    fn();
+    xSemaphoreGive(audioMutex);
+  } else {
+    Serial.println("[AUDIO] command mutex timeout");
+  }
+}
+
+static void stopAudio();
+
+static void muteRemoteAudioForTransition() {
+  audioFadePending = false;
+  if (!audio || !audioMutex) return;
+  uint8_t level = audioAppliedVolume;
+  while (level > 0) {
+    level = level > 4 ? (uint8_t)(level - 4) : 0;
+    const uint8_t step = level;
+    audioCmd([step] { audio->setVolume(step); });
+    audioAppliedVolume = step;
+    delay(4);
+  }
+  audioCmd([] { audio->setVolume(0); });
+  audioAppliedVolume = 0;
+}
+
+static bool startRemoteAudio() {
+  if (!audio || !audioMutex || !ytServer.length()) return false;
+  const String url = ytServer + "/stream.mp3";
+  bool started = false;
+  muteRemoteAudioForTransition();
+  audioDecoderReady = false;
+  audioFadePending = false;
+  dacQuantErrorLeft = 0;
+  dacQuantErrorRight = 0;
+  dacDitherStateLeft = 0x6D2B79F5u;
+  dacDitherStateRight = 0xA341316Cu;
+  audioCmd([&] {
+    audio->setVolume(0);
+    audio->stopSong();
+    audio->setVolume(0);
+    started = audio->connecttohost(url.c_str());
+  });
+  audioAppliedVolume = 0;
+  remoteAudioActive = started;
+  st.hasAudio = started;
+  if (started) {
+    audioStartedMs = millis();
+    audioBufferEmptySinceMs = 0;
+    audioLastFadeMs = 0;
+  }
+  Serial.printf("[AUDIO] remote start=%d url=%s targetVolume=%u/%u\n",
+                started ? 1 : 0, url.c_str(), (unsigned)st.volume, (unsigned)MAX_VOLUME);
+  return started;
+}
+
+static void serviceRemoteAudioFade() {
+  if (!remoteAudioActive || !audioDecoderReady || !audioFadePending || !audio || !audioMutex) return;
+  const uint32_t now = millis();
+  if (now - audioLastFadeMs < AUDIO_FADE_STEP_MS) return;
+  audioLastFadeMs = now;
+  const uint8_t target = (uint8_t)constrain((int)st.volume, 0, MAX_VOLUME);
+  if (audioAppliedVolume >= target) {
+    audioAppliedVolume = target;
+    audioFadePending = false;
+    return;
+  }
+  const uint8_t next = (uint8_t)min<int>((int)target, (int)audioAppliedVolume + AUDIO_FADE_STEP);
+  audioCmd([next] { audio->setVolume(next); });
+  audioAppliedVolume = next;
+  if (audioAppliedVolume >= target) {
+    audioFadePending = false;
+    Serial.printf("[AUDIO][FADE] ready volume=%u/%u\n", (unsigned)audioAppliedVolume, (unsigned)MAX_VOLUME);
+  }
+}
+
+
+static bool waitForRemoteAudioPrime(uint32_t timeoutMs = 6000) {
+  const uint32_t startedAt = millis();
+  while (millis() - startedAt < timeoutMs) {
+    if (audioDecoderReady) return true;
+
+    bool running = true;
+    if (audio && audioMutex && xSemaphoreTake(audioMutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+      running = audio->isRunning();
+      xSemaphoreGive(audioMutex);
+    }
+    // Allow the HTTP header/codec parser a short startup window, but do not wait
+    // the full timeout after a hard decoder allocation failure.
+    if (!running && millis() - startedAt > 300) return false;
+    delay(5);
+  }
+  return audioDecoderReady;
+}
+
+static bool primeRemoteAudio() {
+  for (int attempt = 1; attempt <= 2; ++attempt) {
+    if (startRemoteAudio() && waitForRemoteAudioPrime()) {
+      // Decoder work buffers are now allocated. Stop only the transport/output;
+      // ESP32-audioI2S keeps decoder buffers allocated across stopSong(), so the
+      // real playback reconnect after video HTTP is ready does not fragment heap.
+      muteRemoteAudioForTransition();
+      audioCmd([] { audio->stopSong(); });
+      remoteAudioActive = false;
+      st.hasAudio = false;
+      audioBufferEmptySinceMs = 0;
+      Serial.printf("[AUDIO][PRIME] decoder ready+parked attempt=%d heap=%u largest=%u\n",
+                    attempt, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+      return true;
+    }
+    Serial.printf("[AUDIO][PRIME] failed attempt=%d heap=%u largest=%u\n",
+                  attempt, ESP.getFreeHeap(), ESP.getMaxAllocHeap());
+    stopAudio();
+    delay(80);
+  }
+  return false;
+}
+
+static void stopAudio() {
+  const bool wasActive = remoteAudioActive;
+  if (audio && audioMutex) {
+    muteRemoteAudioForTransition();
+    audioCmd([] { audio->stopSong(); });
+  }
+  remoteAudioActive = false;
+  st.hasAudio = false;
+  audioDecoderReady = false;
+  audioFadePending = false;
+  audioAppliedVolume = 0;
+  audioBufferEmptySinceMs = 0;
+  if (wasActive) Serial.println("[AUDIO] remote stopped");
+}
+
+static void adjustVolume(int delta) {
+  const int next = constrain((int)st.volume + delta, 0, MAX_VOLUME);
+  if (next == st.volume) return;
+  st.volume = (uint8_t)next;
+  if (audio && audioMutex) audioCmd([] { audio->setVolume(st.volume); });
+  showOsd();
+  ytOsdDirty = true;
+  Serial.printf("[AUDIO][VOL] %u/%u\n", (unsigned)st.volume, (unsigned)MAX_VOLUME);
+}
+
+static void showVolumePopup() {
+  volumePopupVisible = true;
+  volumePopupShownMs = millis();
+}
+
+static void drawVolumePopup() {
+  const int16_t cx = ui().width() / 2;
+  const int16_t cy = ui().height() / 2;
+  const int16_t w = 156;
+  const int16_t h = 72;
+  const int16_t x = cx - w / 2;
+  const int16_t y = cy - h / 2;
+  const uint16_t bg = ui().color565(10, 10, 12);
+
+  ui().fillRounded(x, y, w, h, 10, bg);
+  ui().drawRounded(x, y, w, h, 10, TFT_CYAN);
+  ui().setDatum(MC_DATUM);
+  ui().setTextColor(TFT_LIGHTGREY, bg);
+  ui().text("VOLUME", cx, y + 18, 2);
+  ui().setTextColor(TFT_YELLOW, bg);
+  ui().text(String("VOL ") + String(st.volume) + "/" + String(MAX_VOLUME), cx, y + 48, 3);
+}
+
+static void serviceVolumePopup() {
+  if (!volumePopupVisible) return;
+  if (millis() - volumePopupShownMs <= VOLUME_POPUP_MS) {
+    drawVolumePopup();
+    return;
+  }
+
+  volumePopupVisible = false;
+  switch (st.screen) {
+    case Screen::HOME:
+    case Screen::SD_BROWSER:
+    case Screen::YT_BROWSER:
+    case Screen::TV_BROWSER:
+    case Screen::YT_KEYBOARD:
+    case Screen::WIFI_LIST:
+    case Screen::WIFI_PASSWORD:
+      st.dirty = true;
+      break;
+    case Screen::YT_PLAYER:
+      ytOsdDirty = true;
+      break;
+    case Screen::SD_PLAYER:
+      break;
+  }
+}
+
+static void cycleBootVolume() {
+  st.volume = st.volume >= MAX_VOLUME ? 0 : (uint8_t)(st.volume + 1);
+  if (audio && audioMutex) audioCmd([] { audio->setVolume(st.volume); });
+  showVolumePopup();
+  Serial.printf("[AUDIO][BOOT][VOL] %u/%u\n", (unsigned)st.volume, (unsigned)MAX_VOLUME);
+}
+
+static void serviceRemoteAudioHealth() {
+  if (st.screen != Screen::YT_PLAYER || !ytStreamActive || !audio || !audioMutex || !ytServer.length()) return;
+
+  const uint32_t now = millis();
+  if (now - audioLastHealthMs < AUDIO_HEALTH_MS) return;
+  audioLastHealthMs = now;
+
+  bool running = false;
+  uint32_t buffered = 0;
+  // Never block video rendering just to inspect audio. If the decoder task owns
+  // the mutex right now, defer this health sample to the next loop.
+  if (xSemaphoreTake(audioMutex, 0) != pdTRUE) return;
+  running = audio->isRunning();
+  if (running) buffered = audio->inBufferFilled();
+  xSemaphoreGive(audioMutex);
+
+  if (running) {
+    remoteAudioActive = true;
+    st.hasAudio = true;
+    if (buffered == 0 && now - audioStartedMs > 5000) {
+      if (!audioBufferEmptySinceMs) audioBufferEmptySinceMs = now;
+    } else {
+      audioBufferEmptySinceMs = 0;
+    }
+
+    if (now - audioLastHealthLogMs >= 5000) {
+      audioLastHealthLogMs = now;
+      Serial.printf("[AUDIO][HEALTH] running=1 buffer=%lu heap=%u\n",
+                    (unsigned long)buffered, ESP.getFreeHeap());
+    }
+
+    // A TCP socket may stay nominally connected while no MP3 bytes arrive.
+    // Restart audio only after a sustained empty buffer; video stays untouched.
+    if (!audioBufferEmptySinceMs || now - audioBufferEmptySinceMs < AUDIO_EMPTY_RESTART_MS) return;
+    Serial.printf("[AUDIO][HEALTH] buffer empty %lums -> reconnect\n",
+                  (unsigned long)(now - audioBufferEmptySinceMs));
+    muteRemoteAudioForTransition();
+    audioCmd([] { audio->stopSong(); });
+    remoteAudioActive = false;
+    st.hasAudio = false;
+    audioBufferEmptySinceMs = 0;
+  } else {
+    remoteAudioActive = false;
+    st.hasAudio = false;
+  }
+
+  if (now - audioLastRetryMs < AUDIO_RETRY_MS) return;
+  audioLastRetryMs = now;
+  Serial.println("[AUDIO][HEALTH] decoder stopped -> retry /stream.mp3");
+  startRemoteAudio();
+}
+
+static void initBootVolumeButton() {
+  pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
+  bootRawDown = digitalRead(BOOT_BUTTON_PIN) == LOW;
+  bootStableDown = bootRawDown;
+  bootIgnoreUntilRelease = bootStableDown;
+  bootRawChangedMs = millis();
+  bootPressedMs = bootRawChangedMs;
+  Serial.println("[AUDIO][BOOT] press cycles VOL 0..MAX and wraps");
+}
+
+static void handleBootVolumeButton() {
+  const uint32_t now = millis();
+  const bool rawDown = digitalRead(BOOT_BUTTON_PIN) == LOW;
+  if (rawDown != bootRawDown) {
+    bootRawDown = rawDown;
+    bootRawChangedMs = now;
+  }
+  if (rawDown == bootStableDown || now - bootRawChangedMs < BOOT_DEBOUNCE_MS) return;
+
+  bootStableDown = rawDown;
+  if (bootStableDown) {
+    bootPressedMs = now;
+    return;
+  }
+
+  if (bootIgnoreUntilRelease) {
+    bootIgnoreUntilRelease = false;
+    return;
+  }
+
+  // One volume step per debounced release. At MAX the next press wraps to 0.
+  cycleBootVolume();
 }
 
 static String fmtTime(uint32_t sec) {
@@ -221,6 +679,34 @@ static String shorten(const String &s, size_t n) {
   if (count <= n) return s;
   const size_t keep = n > 3 ? n - 3 : n;
   return s.substring(0, utf8ByteIndex(s, keep)) + "...";
+}
+
+static size_t fitUtf8PrefixBytes(const String &s, size_t startByte, int16_t maxWidth, uint8_t size) {
+  if (startByte >= s.length() || maxWidth <= 0) return startByte;
+  size_t i = startByte;
+  size_t best = startByte;
+  size_t lastSpace = startByte;
+  while (i < s.length()) {
+    const size_t next = utf8Step(s, i);
+    const String candidate = s.substring(startByte, next);
+    if (ui().textWidth(candidate, size) > maxWidth) break;
+    best = next;
+    if (s[next - 1] == ' ') lastSpace = next;
+    i = next;
+  }
+  if (best < s.length() && lastSpace > startByte) return lastSpace;
+  return best;
+}
+
+static String fitTextPx(const String &s, int16_t maxWidth, uint8_t size) {
+  if (!s.length() || maxWidth <= 0) return "";
+  if (ui().textWidth(s, size) <= maxWidth) return s;
+  const String dots = "...";
+  const int16_t textBudget = max<int16_t>(0, maxWidth - ui().textWidth(dots, size));
+  const size_t end = fitUtf8PrefixBytes(s, 0, textBudget, size);
+  String out = s.substring(0, end);
+  out.trim();
+  return out + dots;
 }
 
 static int copyYTDecodedBlock(JPEGDRAW *p) {
@@ -266,6 +752,14 @@ static bool allocateYTFrameBuffer() {
   }
 
   const size_t partBytes = (size_t)YT_FRAME_W * YT_FRAME_PART_H * sizeof(uint16_t);
+  const size_t totalBytes = partBytes * YT_FRAME_PARTS;
+  constexpr size_t MEDIA_HEAP_RESERVE = 80 * 1024;
+  if (ESP.getFreeHeap() < totalBytes + MEDIA_HEAP_RESERVE) {
+    Serial.printf("[YTBUF] skip full frame: free=%u need=%u+reserve=%u -> DIRECT\n",
+                  ESP.getFreeHeap(), (unsigned)totalBytes, (unsigned)MEDIA_HEAP_RESERVE);
+    freeYTFrameBuffer();
+    return false;
+  }
   Serial.printf("[YTBUF] split alloc free=%u largest=%u part=%u x%d\n",
                 ESP.getFreeHeap(), ESP.getMaxAllocHeap(), (unsigned)partBytes, YT_FRAME_PARTS);
   for (int i = 0; i < YT_FRAME_PARTS; ++i) {
@@ -670,10 +1164,12 @@ static void setPlaying(bool p) {
   } else {
     st.pausedAtMs = millis();
   }
+  if (st.hasAudio && audio && audioMutex) audioCmd([] { audio->pauseResume(); });
   showOsd();
 }
 
 static void stopSDPlayback() {
+  if (st.hasAudio && audio && audioMutex) audioCmd([] { audio->stopSong(); });
   if (st.vfile) st.vfile.close();
   invalidateIndex(st.idx);
   st.hasAudio = false;
@@ -700,7 +1196,29 @@ static bool startSDPlayback(const String &base) {
     st.idx.frames = 0;
     st.idx.valid = false;
   }
-  st.hasAudio = false;  // Wi-Fi-first build: audio disabled for now
+  String mp3 = base + ".mp3";
+  String audioFallback;
+  if (!SD.exists(mp3)) {
+    String leaf = base;
+    const int slash = leaf.lastIndexOf('/');
+    if (slash >= 0) leaf = leaf.substring(slash + 1);
+    audioFallback = "/Audio/" + leaf + ".mp3";
+    if (SD.exists(audioFallback)) mp3 = audioFallback;
+    else mp3 = "";
+  }
+  st.hasAudio = audio && audioMutex && mp3.length();
+  if (st.hasAudio) {
+    audioCmd([mp3] {
+      audio->setVolume(st.volume);
+      if (!audio->connecttoFS(SD, mp3.c_str())) {
+        Serial.printf("[AUDIO] failed to open %s\n", mp3.c_str());
+      }
+    });
+    Serial.printf("[AUDIO] SD track=%s volume=%u/%u\n", mp3.c_str(),
+                  (unsigned)st.volume, (unsigned)MAX_VOLUME);
+  } else {
+    Serial.printf("[AUDIO] no SD sidecar for %s (same-folder or /Audio fallback)\n", base.c_str());
+  }
   st.basePath = base;
   st.frame = 0;
   st.playing = true;
@@ -791,8 +1309,11 @@ static void handleSDPlayerTouch() {
         int nb = constrain(st.brightness + dy / 2, 96, 255);
         setBrightness(nb);
       } else {
-        int nv = constrain(st.volume + dy / 24, 0, 21);
-        if (nv != st.volume) st.volume = nv;
+        int nv = constrain(st.volume + dy / 24, 0, MAX_VOLUME);
+        if (nv != st.volume) {
+          st.volume = nv;
+          if (audio && audioMutex) audioCmd([] { audio->setVolume(st.volume); });
+        }
       }
       downY = y;
       showOsd();
@@ -940,38 +1461,339 @@ static void logNetworkState(const char *tag) {
                 WiFi.dnsIP().toString().c_str());
 }
 
-static int scanWiFiAndShow(bool showOnScreen) {
-  Serial.println("[WIFI] scan start");
-  int n = WiFi.scanNetworks(false, true);
-  Serial.printf("[WIFI] scan done: %d networks\n", n);
+static bool loadWiFiCredentials(String &ssid, String &password) {
+  Preferences prefs;
+  if (!prefs.begin("cydwifi", true)) return false;
+  ssid = prefs.getString("ssid", "");
+  password = prefs.getString("pass", "");
+  prefs.end();
+  return ssid.length() > 0;
+}
+
+static void saveWiFiCredentials(const String &ssid, const String &password) {
+  Preferences prefs;
+  if (!prefs.begin("cydwifi", false)) return;
+  prefs.putString("ssid", ssid);
+  prefs.putString("pass", password);
+  prefs.end();
+  Serial.printf("[WIFI] credentials saved ssid='%s'\n", ssid.c_str());
+}
+
+static void clearWiFiCredentials() {
+  Preferences prefs;
+  if (prefs.begin("cydwifi", false)) {
+    prefs.clear();
+    prefs.end();
+  }
+  ytServer = "";
+}
+
+static bool connectWiFiCredentials(const String &ssid, const String &password,
+                                   uint32_t timeoutMs, bool saveOnSuccess) {
+  if (!ssid.length()) return false;
+  Serial.printf("[WIFI] connect ssid='%s' timeout=%lums\n", ssid.c_str(), (unsigned long)timeoutMs);
+  drawStatus(tr("ĐANG KẾT NỐI WI-FI", "CONNECTING WI-FI"), shorten(ssid, 28));
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setAutoReconnect(false);
+  WiFi.setSleep(false);
+  WiFi.disconnect(false, false);
+  delay(100);
+  WiFi.begin(ssid.c_str(), password.c_str());
+  const uint32_t started = millis();
+  uint32_t lastUi = 0;
+  while (WiFi.status() != WL_CONNECTED && millis() - started < timeoutMs) {
+    if (millis() - lastUi > 500) {
+      lastUi = millis();
+      ui().fillRect(30, 158, 260, 24, TFT_BLACK);
+      ui().setDatum(MC_DATUM);
+      ui().setTextColor(TFT_DARKGREY, TFT_BLACK);
+      ui().text(String((millis() - started) / 500 % 4 == 0 ? "." :
+                       (millis() - started) / 500 % 4 == 1 ? ".." :
+                       (millis() - started) / 500 % 4 == 2 ? "..." : "...."), 160, 170, 2);
+    }
+    delay(20);
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.printf("[WIFI] connect failed ssid='%s' status=%d\n", ssid.c_str(), (int)WiFi.status());
+    WiFi.disconnect(false, false);
+    WiFi.setAutoReconnect(true);
+    return false;
+  }
+  WiFi.setAutoReconnect(true);
+  WiFi.setSleep(false);
+  if (saveOnSuccess) saveWiFiCredentials(ssid, password);
+  ytServer = ""; // network may have changed; rediscover the PC server on demand
+  logNetworkState("connected");
+  return true;
+}
+
+static bool connectSavedWiFi(uint32_t timeoutMs = 7000) {
+  String ssid, password;
+  if (!loadWiFiCredentials(ssid, password)) {
+    Serial.println("[WIFI] no saved touchscreen credentials");
+    return false;
+  }
+  return connectWiFiCredentials(ssid, password, timeoutMs, false);
+}
+
+static int scanWiFiForUi() {
+  Serial.println("[WIFI] touchscreen scan start");
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  const int n = WiFi.scanNetworks(false, true);
+  wifiEntries.clear();
   for (int i = 0; i < n; ++i) {
-    Serial.printf("[WIFI] #%02d ssid='%s' rssi=%d ch=%d enc=%d\n",
-                  i, WiFi.SSID(i).c_str(), WiFi.RSSI(i), WiFi.channel(i), (int)WiFi.encryptionType(i));
+    String ssid = WiFi.SSID(i);
+    if (!ssid.length()) continue;
+    bool duplicate = false;
+    for (const auto &entry : wifiEntries) {
+      if (entry.ssid == ssid) { duplicate = true; break; }
+    }
+    if (duplicate) continue;
+    WiFiUiEntry entry;
+    entry.ssid = ssid;
+    entry.rssi = WiFi.RSSI(i);
+    entry.encryption = WiFi.encryptionType(i);
+    wifiEntries.push_back(entry);
+    Serial.printf("[WIFI] UI #%u ssid='%s' rssi=%ld enc=%d\n",
+                  (unsigned)wifiEntries.size(), ssid.c_str(), (long)entry.rssi, (int)entry.encryption);
   }
-  if (showOnScreen) {
-    ui().fillScreen(TFT_BLACK);
-    ui().setDatum(TL_DATUM);
-    ui().setTextColor(TFT_CYAN, TFT_BLACK);
-    ui().text(tr("CHỌN WIFI TRÊN ĐIỆN THOẠI", "SELECT WIFI ON PHONE"), 8, 8, 2);
+  WiFi.scanDelete();
+  wifiScroll = 0;
+  wifiMessage = wifiEntries.empty() ? tr("Không tìm thấy mạng Wi-Fi", "No Wi-Fi networks found") : "";
+  Serial.printf("[WIFI] touchscreen scan done unique=%u\n", (unsigned)wifiEntries.size());
+  return (int)wifiEntries.size();
+}
+
+static void drawWiFiList() {
+  ui().fillScreen(TFT_BLACK);
+  drawHeader(tr("CHỌN WI-FI", "SELECT WI-FI"), true, tr("QUÉT", "SCAN"));
+  if (wifiEntries.empty()) {
+    ui().setDatum(MC_DATUM);
+    ui().setTextColor(TFT_YELLOW, TFT_BLACK);
+    ui().text(wifiMessage.length() ? wifiMessage : tr("Không có SSID", "No SSID"), 160, 105, 2);
     ui().setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    ui().text(tr("Kết nối AP: CYD-MiniTV-Setup", "Connect AP: CYD-MiniTV-Setup"), 8, 28, 2);
-    ui().text(tr("Các WiFi gần đây:", "Nearby WiFi networks:"), 8, 50, 2);
-    int rows = min(n, 6);
-    for (int i = 0; i < rows; ++i) {
-      uint16_t c = WiFi.RSSI(i) > -67 ? TFT_GREEN : (WiFi.RSSI(i) > -78 ? TFT_YELLOW : TFT_DARKGREY);
-      ui().setTextColor(c, TFT_BLACK);
-      String line = String(i + 1) + ". " + WiFi.SSID(i);
-      if (line.length() > 32) line = line.substring(0, 31) + "~";
-      ui().text(line, 12, 74 + i * 22, 2);
-    }
-    if (n <= 0) {
-      ui().setTextColor(TFT_RED, TFT_BLACK);
-      ui().text(tr("Không quét thấy SSID", "No SSID found"), 12, 80, 2);
-    }
-    ui().setTextColor(TFT_WHITE, TFT_BLACK);
-    ui().text(tr("Portal sẽ hiện danh sách SSID để chọn", "Portal will show SSIDs to choose"), 8, 218, 1);
+    ui().text(tr("Chạm QUÉT để thử lại", "Tap SCAN to retry"), 160, 138, 2);
+    st.dirty = false;
+    return;
   }
-  return n;
+  ui().setDatum(TL_DATUM);
+  for (int row = 0; row < WIFI_ROWS; ++row) {
+    int idx = wifiScroll + row;
+    if (idx >= (int)wifiEntries.size()) break;
+    const auto &entry = wifiEntries[idx];
+    const int y = 38 + row * 29;
+    const uint16_t card = ui().color565(20, 23, 29);
+    ui().fillRounded(6, y, 308, 25, 5, card);
+    ui().setTextColor(TFT_WHITE, card);
+    ui().text(shorten(entry.ssid, 25), 13, y + 4, 2);
+    ui().setDatum(MR_DATUM);
+    uint16_t sig = entry.rssi > -67 ? TFT_GREEN : (entry.rssi > -78 ? TFT_YELLOW : TFT_DARKGREY);
+    ui().setTextColor(sig, card);
+    String right = String(entry.rssi) + "dB";
+    if (entry.encryption != WIFI_AUTH_OPEN) right = "* " + right;
+    ui().text(right, 306, y + 12, 1);
+    ui().setDatum(TL_DATUM);
+  }
+  ui().setDatum(MC_DATUM);
+  ui().setTextColor(TFT_DARKGREY, TFT_BLACK);
+  ui().text(String(wifiScroll + 1) + "-" + String(min(wifiScroll + WIFI_ROWS, (int)wifiEntries.size())) + "/" + String(wifiEntries.size()), 160, 226, 1);
+  st.dirty = false;
+}
+
+static String maskedWiFiPassword() {
+  if (wifiPasswordVisible) return wifiPassword;
+  String out;
+  for (size_t i = 0; i < wifiPassword.length(); ++i) out += '*';
+  return out;
+}
+
+static char wifiAlphaChar(int row, int col) {
+  const char *src = row == 1 ? WIFI_KB_ALPHA1 : (row == 2 ? WIFI_KB_ALPHA2 : WIFI_KB_ALPHA3);
+  if (col < 0 || col >= (int)strlen(src)) return 0;
+  char c = src[col];
+  if (!wifiKeyboardUpper && c >= 'A' && c <= 'Z') c = (char)(c + ('a' - 'A'));
+  return c;
+}
+
+static char wifiSymbolChar(int row, int col) {
+  if (row < 1 || row > 3 || col < 0 || col > 9) return 0;
+  return WIFI_KB_SYMBOLS[row - 1][col];
+}
+
+static void drawWiFiPassword() {
+  ui().fillScreen(TFT_BLACK);
+  drawHeader(tr("MẬT KHẨU WI-FI", "WI-FI PASSWORD"), true, wifiPasswordVisible ? tr("ẨN", "HIDE") : tr("HIỆN", "SHOW"));
+  const uint16_t field = ui().color565(24, 27, 32);
+  ui().fillRounded(5, 34, 310, 29, 5, field);
+  ui().setDatum(ML_DATUM);
+  ui().setTextColor(TFT_CYAN, field);
+  ui().text(shorten(wifiSelectedSsid, 14), 10, 48, 1);
+  ui().setTextColor(TFT_WHITE, field);
+  ui().text(shorten(maskedWiFiPassword(), 24), 108, 48, 2);
+
+  for (int col = 0; col < 10; ++col) {
+    const int x = col * 32;
+    const int y = 66;
+    const uint16_t bg = ui().color565(28, 31, 37);
+    ui().fillRounded(x + 1, y + 1, 30, 27, 4, bg);
+    ui().setDatum(MC_DATUM); ui().setTextColor(TFT_WHITE, bg);
+    ui().text(String(WIFI_KB_DIGITS[col]), x + 16, y + 14, 1);
+  }
+  for (int row = 1; row <= 3; ++row) {
+    for (int col = 0; col < 10; ++col) {
+      const int x = col * 32;
+      const int y = 66 + row * 30;
+      const uint16_t bg = ui().color565(28, 31, 37);
+      ui().fillRounded(x + 1, y + 1, 30, 27, 4, bg);
+      char c = wifiKeyboardSymbols ? wifiSymbolChar(row, col) : wifiAlphaChar(row, col);
+      String label;
+      if (!wifiKeyboardSymbols && row == 3 && col == 9) label = "<-";
+      else if (c) label = String(c);
+      ui().setDatum(MC_DATUM); ui().setTextColor(TFT_WHITE, bg);
+      ui().text(label, x + 16, y + 14, 1);
+    }
+  }
+
+  const int by = 188;
+  auto bottom = [&](int x, int w, const String &label, uint16_t bg) {
+    ui().fillRounded(x + 1, by + 1, w - 2, 47, 5, bg);
+    ui().setDatum(MC_DATUM); ui().setTextColor(TFT_WHITE, bg);
+    ui().text(label, x + w / 2, by + 24, 1);
+  };
+  const uint16_t normal = ui().color565(38, 42, 49);
+  bottom(0,   48, wifiKeyboardSymbols ? "ABC" : (wifiKeyboardUpper ? "aa" : "AA"), normal);
+  bottom(48,  48, wifiKeyboardSymbols ? tr("XÓA", "CLEAR") : "!@#", normal);
+  bottom(96,  80, tr("CÁCH", "SPACE"), normal);
+  bottom(176, 48, "<-", normal);
+  bottom(224, 96, tr("KẾT NỐI", "CONNECT"), ui().color565(0, 105, 150));
+  if (wifiMessage.length()) {
+    ui().fillRect(0, 176, 320, 12, TFT_BLACK);
+    ui().setDatum(MC_DATUM); ui().setTextColor(TFT_YELLOW, TFT_BLACK);
+    ui().text(shorten(wifiMessage, 42), 160, 182, 1);
+  }
+  st.dirty = false;
+}
+
+static bool finishWiFiConnection(const String &password) {
+  if (!connectWiFiCredentials(wifiSelectedSsid, password, 15000, true)) {
+    wifiMessage = tr("Không kết nối được - kiểm tra mật khẩu", "Connection failed - check password");
+    st.screen = Screen::WIFI_PASSWORD;
+    st.dirty = true;
+    return false;
+  }
+  wifiMessage = "";
+  st.screen = wifiReturnScreen;
+  st.dirty = true;
+  return true;
+}
+
+static void enterWiFiSetup(Screen returnScreen = Screen::HOME) {
+  wifiReturnScreen = returnScreen;
+  wifiSelectedSsid = "";
+  wifiPassword = "";
+  wifiMessage = "";
+  wifiKeyboardUpper = false;
+  wifiKeyboardSymbols = false;
+  wifiPasswordVisible = false;
+  scanWiFiForUi();
+  st.screen = Screen::WIFI_LIST;
+  st.dirty = true;
+}
+
+static void handleWiFiListTouch() {
+  static bool wasDown = false;
+  static int downX = 0, downY = 0, lastX = 0, lastY = 0;
+  int x = lastX, y = lastY;
+  bool down = readTouch(x, y);
+  if (down && !wasDown) { downX = lastX = x; downY = lastY = y; }
+  if (down) { lastX = x; lastY = y; }
+  if (!down && wasDown) {
+    int dy = lastY - downY;
+    int dx = lastX - downX;
+    if (abs(dy) > 24 && abs(dy) > abs(dx)) {
+      int step = abs(dy) > 90 ? 3 : 1;
+      if (dy < 0) wifiScroll = min(wifiScroll + step, max(0, (int)wifiEntries.size() - WIFI_ROWS));
+      else wifiScroll = max(0, wifiScroll - step);
+      st.dirty = true;
+    } else if (downY < 34 && downX < 70) {
+      st.screen = wifiReturnScreen;
+      st.dirty = true;
+    } else if (downY < 34 && downX > 230) {
+      scanWiFiForUi();
+      st.dirty = true;
+    } else if (downY >= 38 && downY < 38 + WIFI_ROWS * 29) {
+      int row = (downY - 38) / 29;
+      int idx = wifiScroll + row;
+      if (idx >= 0 && idx < (int)wifiEntries.size()) {
+        wifiSelectedSsid = wifiEntries[idx].ssid;
+        wifiPassword = "";
+        wifiMessage = "";
+        wifiKeyboardUpper = false;
+        wifiKeyboardSymbols = false;
+        wifiPasswordVisible = false;
+        if (wifiEntries[idx].encryption == WIFI_AUTH_OPEN) {
+          finishWiFiConnection("");
+        } else {
+          st.screen = Screen::WIFI_PASSWORD;
+          st.dirty = true;
+        }
+      }
+    }
+  }
+  wasDown = down;
+}
+
+static void handleWiFiPasswordTouch() {
+  static bool wasDown = false;
+  static int lastX = 0, lastY = 0;
+  int x = lastX, y = lastY;
+  bool down = readTouch(x, y);
+  if (down) { lastX = x; lastY = y; }
+  if (!down && wasDown) {
+    x = lastX; y = lastY;
+    if (y < 34 && x < 70) {
+      st.screen = Screen::WIFI_LIST;
+      st.dirty = true;
+    } else if (y < 34 && x > 230) {
+      wifiPasswordVisible = !wifiPasswordVisible;
+      st.dirty = true;
+    } else if (y >= 66 && y < 186) {
+      int row = (y - 66) / 30;
+      int col = constrain(x / 32, 0, 9);
+      if (row == 0) {
+        if (wifiPassword.length() < 63) wifiPassword += WIFI_KB_DIGITS[col];
+      } else if (!wifiKeyboardSymbols && row == 3 && col == 9) {
+        if (wifiPassword.length()) wifiPassword.remove(wifiPassword.length() - 1);
+      } else {
+        char c = wifiKeyboardSymbols ? wifiSymbolChar(row, col) : wifiAlphaChar(row, col);
+        if (c && wifiPassword.length() < 63) wifiPassword += c;
+      }
+      wifiMessage = "";
+      st.dirty = true;
+    } else if (y >= 188) {
+      if (x < 48) {
+        if (wifiKeyboardSymbols) wifiKeyboardSymbols = false;
+        else wifiKeyboardUpper = !wifiKeyboardUpper;
+      } else if (x < 96) {
+        if (wifiKeyboardSymbols) wifiPassword = "";
+        else wifiKeyboardSymbols = true;
+      } else if (x < 176) {
+        if (wifiPassword.length() < 63) wifiPassword += ' ';
+      } else if (x < 224) {
+        if (wifiPassword.length()) wifiPassword.remove(wifiPassword.length() - 1);
+      } else {
+        if (wifiPassword.length() < 8) {
+          wifiMessage = tr("Mật khẩu WPA cần ít nhất 8 ký tự", "WPA password needs at least 8 characters");
+        } else {
+          finishWiFiConnection(wifiPassword);
+        }
+      }
+      st.dirty = true;
+    }
+  }
+  wasDown = down;
 }
 
 static bool ensureWiFi() {
@@ -980,32 +1802,10 @@ static bool ensureWiFi() {
     WiFi.setSleep(false);
     return true;
   }
-
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect(false, false);
-  delay(120);
-  scanWiFiAndShow(true);
-
-  Serial.println("[WIFI] starting WiFiManager portal: CYD-MiniTV-Setup");
-  WiFiManager wm;
-  wm.setDebugOutput(true);
-  wm.setConnectTimeout(15);
-  wm.setConfigPortalTimeout(180);
-  wm.setMinimumSignalQuality(1);
-  wm.setRemoveDuplicateAPs(true);
-  wm.setScanDispPerc(true);
-  const char *menu[] = {"wifi", "info", "exit"};
-  wm.setMenu(menu, 3);
-  bool ok = wm.autoConnect("CYD-MiniTV-Setup");
-  Serial.printf("[WIFI] WiFiManager returned=%d status=%d\n", ok ? 1 : 0, (int)WiFi.status());
-  if (!ok || WiFi.status() != WL_CONNECTED) {
-    ytMessage = "WiFi chua ket noi";
-    logNetworkState("connect-failed");
-    return false;
-  }
-  WiFi.setSleep(false);
-  logNetworkState("connected");
-  return true;
+  if (connectSavedWiFi(7000)) return true;
+  ytMessage = tr("Chưa kết nối Wi-Fi", "Wi-Fi not connected");
+  enterWiFiSetup(st.screen);
+  return false;
 }
 
 static IPAddress subnetBroadcast() {
@@ -1028,7 +1828,7 @@ static bool loadServerCache(IPAddress &ip, uint16_t &port) {
   Preferences pref;
   if (!pref.begin("cydtv", true)) return false;
   String host = pref.getString("server_ip", "");
-  port = pref.getUShort("server_port", 8765);
+  port = pref.getUShort("server_port", YT_SERVER_PORT);
   pref.end();
   if (!host.length() || !ip.fromString(host)) return false;
   Serial.printf("[SERVER] cached NVS %s:%u\n", host.c_str(), port);
@@ -1087,7 +1887,7 @@ static bool waitDiscoveryReply(uint32_t waitMs) {
                     remote.toString().c_str(), remotePort, n, reply.c_str());
       if (reply.startsWith("CYD_TV_SERVER|")) {
         int port = reply.substring(14).toInt();
-        if (port <= 0) port = 8765;
+        if (port <= 0) port = YT_SERVER_PORT;
         if (validateServer(remote, (uint16_t)port, 150)) return true;
       }
     }
@@ -1103,10 +1903,10 @@ static bool scanSubnetForServer() {
     Serial.printf("[SERVER] fallback /24 scan despite mask=%s\n", mask.toString().c_str());
   }
   drawStatus(tr("QUÉT MẠNG LAN", "SCAN LAN"), tr("UDP không thấy - đang quét TCP...", "UDP failed - scanning TCP..."));
-  Serial.printf("[SERVER] TCP fallback scan subnet %u.%u.%u.0/24 port 8765\n", local[0], local[1], local[2]);
+  Serial.printf("[SERVER] TCP fallback scan subnet %u.%u.%u.0/24 port %u\n", local[0], local[1], local[2], YT_SERVER_PORT);
 
   IPAddress gw = WiFi.gatewayIP();
-  if (gw != local && validateServer(gw, 8765, 50)) return true;
+  if (gw != local && validateServer(gw, YT_SERVER_PORT, 80)) return true;
 
   // Scan the same /24. A short timeout keeps worst case to a few seconds.
   for (int host = 1; host <= 254; ++host) {
@@ -1119,7 +1919,7 @@ static bool scanSubnetForServer() {
       ui().setTextColor(TFT_DARKGREY, TFT_BLACK);
       ui().text(String("IP ") + ip.toString(), 160, 170, 2);
     }
-    if (validateServer(ip, 8876, 28)) return true;
+    if (validateServer(ip, YT_SERVER_PORT, 40)) return true;
     delay(1);
   }
   return false;
@@ -1158,7 +1958,7 @@ static bool discoverYTServer() {
 
   Serial.println("[SERVER] UDP discovery failed, trying last-known NVS cache");
   IPAddress cachedIp;
-  uint16_t cachedPort = 8876;
+  uint16_t cachedPort = YT_SERVER_PORT;
   if (loadServerCache(cachedIp, cachedPort) && validateServer(cachedIp, cachedPort, 120)) {
     Serial.printf("[SERVER] found by NVS cache: %s\n", ytServer.c_str());
     return true;
@@ -1254,7 +2054,7 @@ static void handleSerialDebug() {
       logNetworkState("uart");
       Serial.printf("[UART] ytServer='%s'\n", ytServer.c_str());
     } else if (cmd == "scan") {
-      scanWiFiAndShow(false);
+      scanWiFiForUi();
     } else if (cmd == "discover") {
       ytServer = "";
       bool ok = discoverYTServer();
@@ -1272,6 +2072,22 @@ static void handleSerialDebug() {
     } else if (cmd == "ytopen") {
       bool ok = startYTDebugStream();
       Serial.printf("[UART] ytopen result=%d server='%s'\n", ok ? 1 : 0, ytServer.c_str());
+    } else if (cmd == "chime") {
+      if (!audio || !audioMutex) {
+        Serial.println("[UART] chime unavailable: audio not initialized");
+      } else if (audio->isRunning()) {
+        Serial.println("[UART] chime refused: stop playback first");
+      } else {
+        audioCmd([] { playBootMaxBeeps(*audio); });
+        Serial.println("[UART] chime done");
+      }
+    } else if (cmd.startsWith("vol ")) {
+      const int requested = cmd.substring(4).toInt();
+      st.volume = (uint8_t)constrain(requested, 0, MAX_VOLUME);
+      if (audio && audioMutex) audioCmd([] { audio->setVolume(st.volume); });
+      showOsd();
+      ytOsdDirty = true;
+      Serial.printf("[AUDIO][VOL][UART] %u/%u\n", (unsigned)st.volume, (unsigned)MAX_VOLUME);
     } else if (cmd == "sdprobe") {
       rawSDProbe();
     } else if (cmd == "sd") {
@@ -1329,13 +2145,13 @@ static void handleSerialDebug() {
       if (!sdReady) Serial.println("[PLAYTEST] SD not ready");
       else if (!startSDPlayback(String(VIDEO_DIR) + "/REAL_TEST")) Serial.println("[PLAYTEST] REAL_TEST failed");
     } else if (cmd == "clearwifi") {
-      Serial.println("[UART] clearing WiFi credentials and restarting");
-      WiFiManager wm;
-      wm.resetSettings();
+      Serial.println("[UART] clearing touchscreen WiFi credentials and restarting");
+      clearWiFiCredentials();
+      WiFi.disconnect(true, true);
       delay(200);
       ESP.restart();
     } else if (cmd == "help") {
-      Serial.println("[UART] commands: help | net | scan | sdprobe | sd | ready | discover | tftinfo | tfttest | touch | heap | fps | rbswap on/off | colorauto | color A/B/C/D | playtest | playreal | clearwifi");
+      Serial.println("[UART] commands: help | net | scan | chime | vol 0..21 | sdprobe | sd | ready | discover | tftinfo | tfttest | touch | heap | fps | rbswap on/off | colorauto | color A/B/C/D | playtest | playreal | clearwifi");
     } else {
       Serial.println("[UART] unknown command; type help");
     }
@@ -1445,22 +2261,36 @@ static void drawYTBrowser() {
     if (idx >= (int)ytItems.size()) break;
     int y = 36 + row * YT_ROW_H;
     const YTItem &v = ytItems[idx];
-    ui().fillRect(0, y, 320, YT_ROW_H - 2, ui().color565(9, 10, 13));
-    ui().fillRect(4, y + 4, 96, 54, ui().color565(30, 30, 34));
-    if (!drawYTThumbnail(v, 4, y + 4)) {
+    const uint16_t rowBg = ui().color565(9, 10, 13);
+    const uint16_t thumbBg = ui().color565(30, 30, 34);
+    ui().fillRect(0, y, 320, YT_ROW_H - 2, rowBg);
+    ui().fillRect(YT_THUMB_X, y + 4, YT_THUMB_W, YT_THUMB_H, thumbBg);
+    if (!drawYTThumbnail(v, YT_THUMB_X, y + 4)) {
       ui().setDatum(MC_DATUM);
-      ui().setTextColor(TFT_DARKGREY, ui().color565(30, 30, 34));
-      ui().text("YT", 52, y + 31, 4);
+      ui().setTextColor(TFT_DARKGREY, thumbBg);
+      ui().text("YT", YT_THUMB_X + YT_THUMB_W / 2, y + 31, 4);
     }
+    // Old server caches were 112x63 while this slot is 96x54. Mask both the
+    // right and bottom overflow so a stale thumbnail can never paint under text.
+    ui().fillRect(YT_THUMB_X + YT_THUMB_W, y + 4, 320 - (YT_THUMB_X + YT_THUMB_W), YT_THUMB_H, rowBg);
+    ui().fillRect(YT_THUMB_X, y + 4 + YT_THUMB_H, 320 - YT_THUMB_X, max(0, YT_ROW_H - 6 - YT_THUMB_H), rowBg);
+
+    const int16_t titleWidth = YT_TEXT_RIGHT - YT_TEXT_X;
+    size_t line1End = fitUtf8PrefixBytes(v.title, 0, titleWidth, 2);
+    String line1 = v.title.substring(0, line1End);
+    line1.trim();
+    size_t line2Start = line1End;
+    while (line2Start < v.title.length() && v.title[line2Start] == ' ') ++line2Start;
+    String line2 = line2Start < v.title.length() ? fitTextPx(v.title.substring(line2Start), titleWidth, 2) : "";
+
     ui().setDatum(TL_DATUM);
-    ui().setTextColor(TFT_WHITE, ui().color565(9, 10, 13));
-    ui().text(shorten(v.title, 27), 106, y + 5, 2);
-    String line2 = utf8Count(v.title) > 27 ? shorten(v.title.substring(utf8ByteIndex(v.title, 24)), 27) : "";
-    if (line2.length()) ui().text(line2, 106, y + 23, 2);
-    ui().setTextColor(TFT_DARKGREY, ui().color565(9, 10, 13));
-    String meta = shorten(v.channel, 18);
+    ui().setTextColor(TFT_WHITE, rowBg);
+    ui().text(line1, YT_TEXT_X, y + 5, 2);
+    if (line2.length()) ui().text(line2, YT_TEXT_X, y + 23, 2);
+    ui().setTextColor(TFT_DARKGREY, rowBg);
+    String meta = v.channel;
     if (v.duration) meta += "  " + fmtTime(v.duration);
-    ui().text(meta, 106, y + 44, 1);
+    ui().text(fitTextPx(meta, titleWidth, 1), YT_TEXT_X, y + 44, 1);
   }
   ui().setDatum(BR_DATUM);
   ui().setTextColor(TFT_DARKGREY, TFT_BLACK);
@@ -1505,7 +2335,8 @@ static void handleYTBrowserTouch() {
         remoteReturnScreen = Screen::YT_BROWSER;
         // store selected URL temporarily in query-like global via direct start call
         YTItem chosen = ytItems[idx];
-        // close existing stream before opening new one
+        // Close both transports before selecting a new media session.
+        stopAudio();
         if (ytStreamActive) { ytStreamHttp.end(); ytStreamActive = false; }
         drawStatus(tr("ĐANG MỞ VIDEO", "OPENING VIDEO"), shorten(chosen.title, 28));
         HTTPClient cmd;
@@ -1518,6 +2349,9 @@ static void handleYTBrowserTouch() {
           int rc = cmd.POST(body);
           cmd.end();
           if (rc >= 200 && rc < 300) {
+            // Allocate the MP3 decoder while heap is still contiguous. The decoder
+            // buffers persist across stopSong()/reconnect, so later watchdog retries
+            // do not compete with JPEG allocations.
             allocateYTFrameBuffer();
             ytStreamHttp.useHTTP10(true);
             ytStreamHttp.setTimeout(10000);
@@ -1526,10 +2360,13 @@ static void handleYTBrowserTouch() {
               if (sc == HTTP_CODE_OK) {
                 ytStreamClient = ytStreamHttp.getStreamPtr();
                 ytStreamActive = true;
+                // Real playback starts only after video HTTP is established.
+                startRemoteAudio();
                 ytParserInJpeg = false;
                 ytParserPrev = -1;
                 ytParserN = 0;
                 ytParserLastByteMs = millis();
+                armYTVideoWatchdog();
                 ytStatsStartMs = millis();
                 ytFramesRx = ytFramesDecoded = ytFramesDropped = 0;
                 ytJpegBytes = ytDecodeUs = ytRenderUs = 0;
@@ -1538,7 +2375,16 @@ static void handleYTBrowserTouch() {
                 st.osdShownMs = millis();
                 ytOsdDirty = true;
                 ui().fillScreen(TFT_BLACK);
-              } else { ytStreamHttp.end(); ytMessage = "Stream HTTP " + String(sc); st.dirty = true; }
+              } else {
+                ytStreamHttp.end();
+                stopAudio();
+                ytMessage = "Stream HTTP " + String(sc);
+                st.dirty = true;
+              }
+            } else {
+              stopAudio();
+              ytMessage = tr("Không mở được luồng video", "Could not open video stream");
+              st.dirty = true;
             }
           } else { ytMessage = "Play HTTP " + String(rc); st.dirty = true; }
         }
@@ -1629,6 +2475,7 @@ static void drawTVBrowser() {
 
 static bool startTVChannel(const TVItem &item) {
   if (!ensureYTReady()) return false;
+  stopAudio();
   if (ytStreamActive) { ytStreamHttp.end(); ytStreamActive = false; }
   drawStatus(tr("ĐANG MỞ KÊNH", "OPENING CHANNEL"), item.name);
 
@@ -1653,13 +2500,20 @@ static bool startTVChannel(const TVItem &item) {
     return false;
   }
 
+  // Prime the MP3 decoder before JPEG/video allocations can fragment internal RAM.
   allocateYTFrameBuffer();
   ytStreamHttp.useHTTP10(true);
-  ytStreamHttp.setTimeout(10000);
-  if (!ytStreamHttp.begin(ytServer + "/stream.mjpg")) return false;
+  // Live HLS can spend >10 s in FFmpeg/JPEG prebuffer before the first frame.
+  // A 10 s HTTP timeout made channel selection fall straight back to the TV browser.
+  ytStreamHttp.setTimeout(30000);
+  if (!ytStreamHttp.begin(ytServer + "/stream.mjpg")) {
+    stopAudio();
+    return false;
+  }
   int sc = ytStreamHttp.GET();
   if (sc != HTTP_CODE_OK) {
     ytStreamHttp.end();
+    stopAudio();
     tvMessage = "Stream HTTP " + String(sc);
     st.dirty = true;
     return false;
@@ -1670,10 +2524,12 @@ static bool startTVChannel(const TVItem &item) {
   remoteReturnScreen = Screen::TV_BROWSER;
   ytStreamClient = ytStreamHttp.getStreamPtr();
   ytStreamActive = true;
+  startRemoteAudio();
   ytParserInJpeg = false;
   ytParserPrev = -1;
   ytParserN = 0;
   ytParserLastByteMs = millis();
+  armYTVideoWatchdog();
   ytStatsStartMs = millis();
   ytFramesRx = ytFramesDecoded = ytFramesDropped = 0;
   ytJpegBytes = ytDecodeUs = ytRenderUs = 0;
@@ -1908,6 +2764,8 @@ static int readNextYTFrame() {
         if (ytParserPrev == 0xFF && b == 0xD9) {
           int len = (int)ytParserN;
           ytFramesRx++;
+          ytLastFrameMs = millis();
+          ytAwaitingFirstFrame = false;
           ytJpegBytes += (uint32_t)len;
           ytParserInJpeg = false;
           ytParserN = 0;
@@ -1924,11 +2782,11 @@ static int readNextYTFrame() {
 
 static bool startYTDebugStream() {
   if (!ensureYTReady()) return false;
-  allocateYTFrameBuffer();
   if (ytStreamActive) {
     ytStreamHttp.end();
     ytStreamActive = false;
   }
+  allocateYTFrameBuffer();
   ytStreamHttp.setTimeout(10000);
   if (!ytStreamHttp.begin(ytServer + "/stream.mjpg")) return false;
   int sc = ytStreamHttp.GET();
@@ -1939,10 +2797,14 @@ static bool startYTDebugStream() {
   }
   ytStreamClient = ytStreamHttp.getStreamPtr();
   ytStreamActive = true;
+  startRemoteAudio();
+  // UART `ytopen` is an end-to-end media diagnostic: start the same MP3 path
+  // used by the normal YouTube/VTV players, without requiring touchscreen input.
   ytParserInJpeg = false;
   ytParserPrev = -1;
   ytParserN = 0;
   ytParserLastByteMs = millis();
+  armYTVideoWatchdog();
   ytStatsStartMs = millis();
   ytFramesRx = ytFramesDecoded = ytFramesDropped = 0;
   ytJpegBytes = ytDecodeUs = ytRenderUs = 0;
@@ -1956,6 +2818,7 @@ static bool startYTDebugStream() {
 }
 
 static void stopYTStream() {
+  stopAudio();
   if (ytStreamActive) ytStreamHttp.end();
   ytStreamActive = false;
   ytStreamClient = nullptr;
@@ -1963,8 +2826,71 @@ static void stopYTStream() {
   ytParserPrev = -1;
   ytParserN = 0;
   ytParserLastByteMs = 0;
+  ytLastFrameMs = 0;
+  ytVideoOpenedMs = 0;
+  ytAwaitingFirstFrame = true;
   st.screen = remoteReturnScreen;
   st.dirty = true;
+}
+
+static bool restartRemoteVideoOnly(const char *reason) {
+  const uint32_t now = millis();
+  ytLastVideoReconnectMs = now;
+  Serial.printf("[YT][WATCHDOG] remote video reconnect: %s\n", reason ? reason : "stall");
+
+  if (ytStreamActive) ytStreamHttp.end();
+  ytStreamActive = false;
+  ytStreamClient = nullptr;
+  ytParserInJpeg = false;
+  ytParserPrev = -1;
+  ytParserN = 0;
+
+  ytStreamHttp.useHTTP10(true);
+  ytStreamHttp.setTimeout(6000);
+  if (!ytStreamHttp.begin(ytServer + "/stream.mjpg")) {
+    Serial.println("[YT][WATCHDOG] remote begin failed");
+    return false;
+  }
+  const int sc = ytStreamHttp.GET();
+  if (sc != HTTP_CODE_OK) {
+    Serial.printf("[YT][WATCHDOG] remote HTTP=%d\n", sc);
+    ytStreamHttp.end();
+    return false;
+  }
+
+  ytStreamClient = ytStreamHttp.getStreamPtr();
+  ytStreamActive = true;
+  armYTVideoWatchdog();
+  ytOsdDirty = true;
+  Serial.println("[YT][WATCHDOG] remote video reconnected");
+  return true;
+}
+
+static bool serviceYTVideoHealth() {
+  if (st.screen != Screen::YT_PLAYER || !ytStreamActive || !ytStreamClient) return true;
+  // A cleanly closed socket is handled by the normal end-of-stream path. The
+  // watchdog targets the harder case: TCP still says connected but frames stop.
+  if (!ytStreamClient->connected()) return true;
+
+  const uint32_t now = millis();
+  const bool isLiveTV = remoteReturnScreen == Screen::TV_BROWSER;
+  const uint32_t age = ytAwaitingFirstFrame ? (now - ytVideoOpenedMs) : (now - ytLastFrameMs);
+  const uint32_t steadyLimit = isLiveTV ? LIVE_VIDEO_STALL_MS : YT_VIDEO_STALL_MS;
+  const uint32_t limit = ytAwaitingFirstFrame ? YT_VIDEO_START_GRACE_MS : steadyLimit;
+  if (age <= limit) return true;
+  if (now - ytLastVideoReconnectMs < YT_VIDEO_RECONNECT_COOLDOWN_MS) return true;
+
+  Serial.printf("[YT][WATCHDOG] no complete frame for %lums source=%s\n",
+                (unsigned long)age, remoteSourceLabel.c_str());
+
+  // The PC server now persists YouTube resume_seconds and restarts FFmpeg inside
+  // the same playback generation, so reopening /stream.mjpg is safe for both live
+  // TV and YouTube. Keep the MP3 transport untouched so audio does not pop/restart.
+  if (restartRemoteVideoOnly("no complete frame")) return true;
+  if (isLiveTV) tvMessage = "Live video reconnect failed";
+  else ytMessage = "Video reconnect failed";
+  stopYTStream();
+  return false;
 }
 
 static void drawYTOSD() {
@@ -1981,6 +2907,9 @@ static void drawYTOSD() {
   ui().setDatum(MC_DATUM);
   ui().setTextColor(TFT_YELLOW, TFT_BLACK);
   ui().text(remoteSourceLabel, 160, 228, 2);
+  ui().setDatum(MR_DATUM);
+  ui().setTextColor(remoteAudioActive ? TFT_GREEN : TFT_DARKGREY, TFT_BLACK);
+  ui().text(String("VOL ") + String(st.volume), 314, 228, 1);
 }
 
 static void clearYTOSD() {
@@ -2038,11 +2967,16 @@ static void drawHome() {
   const uint16_t bg = ui().color565(5, 7, 11);
   ui().fillScreen(bg);
 
+  const bool wifiConnected = WiFi.status() == WL_CONNECTED;
+  const uint16_t wifiButtonBg = wifiConnected ? ui().color565(14, 48, 36) : ui().color565(28, 31, 37);
   const uint16_t viBg = uiLanguage == UiLanguage::VI ? ui().color565(0, 105, 150) : ui().color565(28, 31, 37);
   const uint16_t enBg = uiLanguage == UiLanguage::EN ? ui().color565(0, 105, 150) : ui().color565(28, 31, 37);
+  ui().fillRounded(4, 3, 64, 22, 5, wifiButtonBg);
   ui().fillRounded(184, 3, 76, 22, 5, viBg);
   ui().fillRounded(264, 3, 52, 22, 5, enBg);
   ui().setDatum(MC_DATUM);
+  ui().setTextColor(WiFi.status() == WL_CONNECTED ? TFT_GREEN : TFT_LIGHTGREY, wifiButtonBg);
+  ui().text("WiFi", 36, 14, 1);
   ui().setTextColor(TFT_WHITE, viBg);
   ui().text("TIẾNG VIỆT", 222, 14, 1);
   ui().setTextColor(TFT_WHITE, enBg);
@@ -2066,10 +3000,6 @@ static void drawHome() {
   ui().text("YOUTUBE", 160, 146, 2);
   ui().setTextColor(TFT_WHITE, tvCard);
   ui().text(tr("TRUYỀN HÌNH", "LIVE TV"), 160, 198, 2);
-
-  ui().setTextColor(WiFi.status() == WL_CONNECTED ? TFT_GREEN : TFT_DARKGREY, bg);
-  ui().text(WiFi.status() == WL_CONNECTED ? ("WiFi  " + WiFi.localIP().toString())
-                                          : tr("WiFi chưa kết nối", "WiFi not connected"), 160, 232, 1);
   st.dirty = false;
 }
 
@@ -2082,7 +3012,9 @@ static void handleHomeTouch() {
   if (!down && wasDown) {
     x = lastX; y = lastY;
     Serial.printf("[TOUCH][HOME] x=%d y=%d\n", x, y);
-    if (y < 32 && x >= 180) {
+    if (y < 32 && x < 80) {
+      enterWiFiSetup(Screen::HOME);
+    } else if (y < 32 && x >= 180) {
       if (x < 262) setLanguage(UiLanguage::VI);
       else setLanguage(UiLanguage::EN);
       st.dirty = true;
@@ -2100,6 +3032,8 @@ static void handleHomeTouch() {
 
 void setup() {
   Serial.begin(115200);
+  initBootVolumeButton();
+
   loadLanguage();
   ledcSetup(BL_CHANNEL, BL_FREQ, BL_RES_BITS);
   ledcAttachPin(BL_PIN, BL_CHANNEL);
@@ -2141,12 +3075,44 @@ void setup() {
   }
 
   if (sdReady) scanVideos();
+
+  // Use the same internal-DAC decoder architecture that is proven to produce
+  // intelligible audio in D:\CYD-MiniTV-forward. Run a short full-scale self-test
+  // before the decoder task starts so the user can hear the hardware audio ceiling.
+  Serial.println("[BOOT] audio init begin");
+  audio = new (audioStorage) Audio(!USE_EXTERNAL_I2S_DAC, USE_EXTERNAL_I2S_DAC ? 3 : 2);
+#if USE_EXTERNAL_I2S_DAC
+  if (!audio->setPinout(I2S_BCLK, I2S_LRC, I2S_DOUT)) {
+    Serial.println("[AUDIO] I2S pinout setup failed");
+  }
+#endif
+  audio->setVolume(st.volume);
+  // Give the onboard amp/supply time to settle before the audible power-on cue.
+  delay(700);
+  playBootMaxBeeps(*audio);
+  // Keep low/bass energy modest; the server also band-limits audio for the tiny speaker.
+  audioMutex = xSemaphoreCreateMutex();
+  if (audioMutex) {
+    BaseType_t ok = xTaskCreatePinnedToCore(audioTask, "audio", 8192, nullptr, 2, &audioTaskHandle, 0);
+    Serial.printf("[AUDIO] task core0=%d local=%s volume=%u/%u heap=%u\n",
+                  ok == pdPASS ? 1 : 0, USE_EXTERNAL_I2S_DAC ? "I2S" : "internal DAC GPIO26",
+                  (unsigned)st.volume, (unsigned)MAX_VOLUME, ESP.getFreeHeap());
+  } else {
+    Serial.println("[AUDIO] mutex create failed");
+  }
+
   WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
   WiFi.setAutoReconnect(true);
   WiFi.setSleep(false);
-  Serial.println("[WIFI] boot: trying saved credentials in background");
-  WiFi.begin();
-  st.screen = Screen::HOME;
+  Serial.println("[WIFI] boot: trying touchscreen-saved credentials");
+  if (connectSavedWiFi(6500)) {
+    st.screen = Screen::HOME;
+  } else {
+    wifiReturnScreen = Screen::HOME;
+    scanWiFiForUi();
+    st.screen = Screen::WIFI_LIST;
+  }
   st.dirty = true;
   if (sdReady) {
     Serial.printf("CYD Mini TV boot: SD=OK type=%u total=%.1fMB used=%.1fMB heap=%u\n", (unsigned)SD.cardType(), SD.totalBytes()/1048576.0, SD.usedBytes()/1048576.0, ESP.getFreeHeap());
@@ -2157,6 +3123,9 @@ void setup() {
 
 void loop() {
   handleSerialDebug();
+  handleBootVolumeButton();
+  serviceRemoteAudioFade();
+  serviceRemoteAudioHealth();
   switch (st.screen) {
     case Screen::HOME:
       if (st.dirty) drawHome();
@@ -2210,7 +3179,20 @@ void loop() {
       delay(8);
       break;
 
+    case Screen::WIFI_LIST:
+      if (st.dirty) drawWiFiList();
+      handleWiFiListTouch();
+      delay(8);
+      break;
+
+    case Screen::WIFI_PASSWORD:
+      if (st.dirty) drawWiFiPassword();
+      handleWiFiPasswordTouch();
+      delay(8);
+      break;
+
     case Screen::YT_PLAYER: {
+      if (!serviceYTVideoHealth()) break;
       handleYTPlayerTouch();
       static uint32_t ytAutoStatMs = 0;
       if (millis() - ytAutoStatMs >= 1000) {
@@ -2232,13 +3214,13 @@ void loop() {
           prepareJPEGDecode();
           uint32_t d0 = micros();
           ytDecodeInProgress = true;
-          int decOk = jpeg.decode(0, ytFrameBufferEnabled ? 0 : YT_VIDEO_Y, 0);
+              int decOk = jpeg.decode(0, ytFrameBufferEnabled ? 0 : YT_VIDEO_Y, 0);
           ytDecodeInProgress = false;
-          ytDecodeUs += (uint32_t)(micros() - d0);
+              ytDecodeUs += (uint32_t)(micros() - d0);
           jpeg.close();
           if (decOk) {
-            if (ytFrameBufferEnabled) presentYTFrame();
-            ytFramesDecoded++;
+                  if (ytFrameBufferEnabled) presentYTFrame();
+                  ytFramesDecoded++;
           } else {
             ytFramesDropped++;
           }
@@ -2263,10 +3245,11 @@ void loop() {
         ytOsdDirty = true;
       }
       if (ytOsdDirty) {
-        if (st.osdVisible) drawYTOSD(); else clearYTOSD();
+          if (st.osdVisible) drawYTOSD(); else clearYTOSD();
         ytOsdDirty = false;
       }
       break;
     }
   }
+  serviceVolumePopup();
 }

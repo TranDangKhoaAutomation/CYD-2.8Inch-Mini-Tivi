@@ -32,6 +32,7 @@ public:
     void setDatum(UiDatum datum) { datum_ = datum; }
     void setTextColor(uint16_t fg, uint16_t bg);
     void text(const String &s, int16_t x, int16_t y, uint8_t size = 1);
+    int16_t textWidth(const String &s, uint8_t size = 1) const;
 private:
     Arduino_GFX *gfx_ = nullptr;
     UiDatum datum_ = TL_DATUM;

@@ -34,8 +34,8 @@ YouTube
   └── Internet -> PC server -> yt-dlp -> FFmpeg -> MJPEG/HTTP -> ESP32
 
 VTV Go
-  └── VTV Go web player -> PC server -> Playwright/Chrome
-                         -> HLS không DRM -> FFmpeg -> MJPEG/HTTP -> ESP32
+  └── VTV Go playback API v21 -> PC server -> HLS không DRM đã probe segment
+                           -> FFmpeg -> MJPEG/MP3 qua HTTP -> ESP32
 ```
 
 PC và ESP32 phải ở **cùng mạng LAN/Wi-Fi**. Firmware tự tìm server bằng UDP discovery.
@@ -317,11 +317,25 @@ Từ thư mục gốc repository:
 python -m pip install -r tools\youtube_tv_server\requirements.txt
 ```
 
-`requirements.txt` gồm Flask, yt-dlp, requests, Pillow và Playwright.
+`requirements.txt` gồm Flask, yt-dlp, requests và Pillow.
 
-Resolver VTV Go dùng **Chrome/Edge hệ thống**, vì vậy không cần tải browser riêng bằng `playwright install` nếu máy đã có Chrome/Edge ở vị trí chuẩn.
+Resolver VTV Go gọi playback API v21, lọc HLS không DRM rồi kiểm tra media playlist/segment thật trước khi chọn CDN; không cần trình duyệt tự động.
 
 ### 8.3 Chạy server nhanh bằng BAT
+
+Tại thư mục gốc project, chạy:
+
+```powershell
+.\start_server.bat
+```
+
+Server này dùng chung cho cả **YouTube** và **VTV Go / Truyền hình**. Để dừng đúng server Mini TV (không ảnh hưởng Python khác), chạy:
+
+```powershell
+.\stop_server.bat
+```
+
+Hai file gốc này gọi các script tương ứng trong `tools\youtube_tv_server`.
 
 ```powershell
 cd tools\youtube_tv_server
@@ -460,8 +474,8 @@ GET /api/tv/channels
 POST /api/tv/play
 ```
 
-6. Server dùng Playwright + Chrome/Edge mở web player chính thức của VTV Go.
-7. Server chỉ lấy nguồn HLS mà web player công khai ở chế độ **không DRM**.
+6. Server gọi playback API v21 của VTV Go và nhận các HLS candidate.
+7. Server chỉ nhận nguồn **không DRM**, probe variant/segment thật và tự failover sang CDN còn sống.
 8. FFmpeg chuyển nguồn đó thành MJPEG cho ESP32.
 
 Catalog hiện cấu hình gồm:

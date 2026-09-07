@@ -122,6 +122,12 @@ void drawUtf8Text(Arduino_GFX *gfx, const String &s, int16_t x, int16_t y,
 }
 } // namespace
 
+int16_t UiDraw::textWidth(const String &s, uint8_t size) const {
+    if (size < 1) size = 1;
+    if (size > 4) size = 4;
+    return measureUtf8Text(s, size);
+}
+
 void UiDraw::text(const String &s, int16_t x, int16_t y, uint8_t size) {
     if (!gfx_) return;
     if (size < 1) size = 1;

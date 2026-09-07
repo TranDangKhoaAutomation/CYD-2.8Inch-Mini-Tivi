@@ -33,7 +33,7 @@
 //   BCK -> GPIO 4, LRCK -> GPIO 22, DIN -> GPIO 27
 //   (short SCK/FLT/DMP/FMT/BYP bridge pads to GND on the DAC board)
 // Option B: onboard amp/speaker via internal DAC on GPIO 26 (mono, lo-fi)
-#define USE_EXTERNAL_I2S_DAC 1
+#define USE_EXTERNAL_I2S_DAC 0
 #define I2S_BCLK  4
 #define I2S_LRC   22
 #define I2S_DOUT  27
@@ -41,6 +41,14 @@
 // ---- Player ----
 #define VIDEO_DIR       "/videos"
 #define SEEK_STEP_SEC   60          // +/- jump per seek button press
-#define DEFAULT_VOLUME  12          // 0..21 (ESP32-audioI2S scale)
+#define MAX_VOLUME      21          // ESP32-audioI2S supports 0..21; 21 is full digital scale
+#define DEFAULT_VOLUME  21          // full AudioI2S range; BOOT cycles 0..21 at runtime
+
+// ---- BOOT button runtime volume control ----
+// Each debounced BOOT press advances volume by one and wraps 21 -> 0. GPIO0 is still
+// the boot strap pin, so holding BOOT during reset still enters ROM download mode.
+#define BOOT_BUTTON_PIN       0
+#define BOOT_DEBOUNCE_MS      35
+#define VOLUME_STEP           1
 #define DEFAULT_BRIGHT  255         // 0..255
 #define OSD_TIMEOUT_MS  3000        // on-screen controls auto-hide

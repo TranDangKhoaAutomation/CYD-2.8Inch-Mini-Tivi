@@ -14,7 +14,9 @@ def test_youtube_osd_stays_outside_video_rect():
     assert 'YT_OSD_BOTTOM_Y = 216' in SRC
     assert 'draw16bitBeRGBBitmap(0, YT_VIDEO_Y' in SRC
     assert 'shorten(ytPlayingTitle' in SRC
-    assert 'ui().text(\"YouTube\", 160, 228, 2);' in SRC
+    assert 'ui().text(remoteSourceLabel, 160, 228, 2);' in SRC
+    assert 'remoteSourceLabel = \"YouTube\"' in SRC
+    assert 'remoteSourceLabel = \"VTV Go\"' in SRC
 
 if __name__ == '__main__':
     test_home_brand_is_simple()
