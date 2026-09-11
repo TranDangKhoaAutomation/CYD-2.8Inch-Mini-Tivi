@@ -2,7 +2,7 @@
 
 Firmware **Mini Tivi** cho board ESP32-2432S028R (CYD 2.8" resistive touch), hỗ trợ phát video từ thẻ SD và xem nội dung online qua server PC trong cùng mạng LAN.
 
-Repository: https://github.com/TranDangKhoaTechnology/CYD-2.8Inch-Mini-Tivi
+Repository: https://github.com/TranDangKhoaAutomation/CYD-2.8Inch-Mini-Tivi
 
 ## 1. Trạng thái hiện tại
 
@@ -101,7 +101,7 @@ Board có đường audio **GPIO26 -> FM8002A -> loa**. Phần cứng này sẽ 
 ### 4.1 Clone repository
 
 ```powershell
-git clone https://github.com/TranDangKhoaTechnology/CYD-2.8Inch-Mini-Tivi.git
+git clone https://github.com/TranDangKhoaAutomation/CYD-2.8Inch-Mini-Tivi.git
 cd CYD-2.8Inch-Mini-Tivi
 ```
 
